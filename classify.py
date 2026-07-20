@@ -362,9 +362,10 @@ def _load_dotenv():
 
 _load_dotenv()
 
-# Confirm the exact model id in Google AI Studio (aistudio.google.com). You can
-# swap it without touching code: set GEMINI_MODEL in .env or export it.
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3-flash")
+# gemini-2.5-flash is broadly available and cheap. To use a different one (e.g. a
+# Gemini 3 flash variant), list what your key supports and set GEMINI_MODEL in
+# .env -- no code change needed. See the README / list-models command.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 # Location-specific rules straight from the City of Philadelphia's curbside
 # single-stream program (phila.gov/programs/recycling-program/what-to-recycle).

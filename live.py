@@ -243,7 +243,7 @@ def move_servo(is_recycle):
 
 # --- the web page ---
 PAGE = """<!doctype html>
-<html><head><title>Trash vs Recycle</title>
+<html><head><meta charset="utf-8"><title>Trash vs Recycle</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
 body{font-family:sans-serif;text-align:center;background:#111;color:#eee;margin:0;padding:16px}
@@ -257,7 +257,10 @@ button:active{background:#1b5e20}
 .engine{margin:10px auto 0;max-width:520px}
 .switch{display:inline-flex;align-items:center;gap:10px;font-size:18px;cursor:pointer;user-select:none}
 .switch input{width:22px;height:22px}
-.enginenote{font-size:15px;color:#9ad;margin-top:6px}
+.enginenote{display:inline-block;font-size:16px;font-weight:bold;margin-top:8px;padding:7px 16px;border-radius:999px;background:#263238;color:#cfd8dc}
+.enginenote.local{background:#1b5e20;color:#fff}
+.enginenote.gemini{background:#4527a0;color:#fff}
+.enginenote.err{background:#b71c1c;color:#fff;font-weight:normal;font-size:14px}
 .reason{font-size:19px;color:#cfd8dc;min-height:26px;margin-top:4px;font-style:italic}
 .sensor{margin:16px auto 0;max-width:520px;padding:12px 14px;border:1px solid #333;border-radius:12px;background:#171717;text-align:left;font-size:16px;line-height:1.5}
 .sensor strong{color:#fff}
@@ -269,7 +272,7 @@ button:active{background:#1b5e20}
 <div><button onclick="armAuto()">ARM AUTO</button></div>
 <div class="engine">
 <label class="switch"><input type="checkbox" id="geminiToggle" onchange="setEngine()"> <span>🤖 Use Gemini 3 + Philadelphia rules</span></label>
-<div id="engineNote" class="enginenote">📟 On-device model (WasteNet)</div>
+<div id="engineNote" class="enginenote local">📟 ACTIVE: On-device ensemble (WasteNet + ONNX)</div>
 </div>
 <div id="result">Hold an object in view, then hit SORT</div>
 <div id="reason" class="reason"></div>
@@ -294,15 +297,31 @@ reason.textContent='';
 fetch('/sort').then(x=>x.json()).then(d=>{
 r.className = d.is_recycle ? 'recycle' : 'trash';
 r.textContent = (d.is_recycle?'♻️ RECYCLE':'🗑️ TRASH') + ' — '+d.label+' ('+Math.round(d.score*100)+'%)';
-reason.textContent = d.reason ? ('“'+d.reason+'”  ·  '+(d.engine==='gemini'?'Gemini · Philly rules':'on-device')) : '';
+var wantGemini=document.getElementById('geminiToggle').checked;
+var tag = d.engine==='gemini' ? 'Gemini · Philly rules' : (wantGemini ? '⚠️ Gemini failed → on-device' : 'on-device ensemble');
+reason.textContent = d.reason ? ('“'+d.reason+'”  ·  '+tag) : tag;
 }).catch(e=>{r.className='trash';r.textContent='error: '+e;});
+}
+function applyEngineBadge(engine, err){
+var note=document.getElementById('engineNote');
+if(engine==='gemini' && !err){
+note.className='enginenote gemini';
+note.textContent='☁️ ACTIVE: Gemini + Philadelphia rules';
+}else if(engine==='gemini' && err){
+note.className='enginenote err';
+note.textContent='⚠️ Gemini failed → running on-device. '+err;
+}else{
+note.className='enginenote local';
+note.textContent='📟 ACTIVE: On-device ensemble (WasteNet + ONNX)';
+}
 }
 function setEngine(){
 var on=document.getElementById('geminiToggle').checked;
 var note=document.getElementById('engineNote');
+note.className='enginenote';
 note.textContent = on ? 'switching to Gemini…' : 'switching to on-device model…';
 fetch('/engine?use=' + (on?'gemini':'local')).then(x=>x.json()).then(d=>{
-note.textContent = d.engine==='gemini' ? '☁️ Gemini 3 + Philadelphia rules (cloud)' : '📟 On-device model (WasteNet)';
+applyEngineBadge(d.engine, d.gemini_error);
 }).catch(e=>{note.textContent='error: '+e;});
 }
 function armAuto(){
@@ -313,14 +332,7 @@ fetch('/arm').then(x=>x.json()).then(d=>{s.textContent=d.status;}).catch(e=>{s.t
 function refreshStatus(){
 fetch('/status').then(x=>x.json()).then(d=>{
 document.getElementById('status').textContent=d.status;
-if(d.engine){
-var note=document.getElementById('engineNote');
-if(d.engine==='gemini'){
-note.textContent = d.gemini_error ? ('⚠️ Gemini failed, using on-device — '+d.gemini_error) : '☁️ Gemini 3 + Philadelphia rules (cloud)';
-}else{
-note.textContent = '📟 On-device model (WasteNet)';
-}
-}
+if(d.engine){ applyEngineBadge(d.engine, d.gemini_error); }
 document.getElementById('sensorState').textContent=d.sensor_state ?? 'idle';
 document.getElementById('baselineValue').textContent=d.baseline_distance_mm == null ? '-' : Math.round(d.baseline_distance_mm) + ' mm';
 document.getElementById('distanceValue').textContent=d.sensor_distance_mm == null ? '-' : Math.round(d.sensor_distance_mm) + ' mm';
@@ -355,7 +367,7 @@ class Handler(server.BaseHTTPRequestHandler):
         if self.path == "/":
             body = PAGE.encode("utf-8")
             self.send_response(200)
-            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", len(body))
             self.end_headers()
             self.wfile.write(body)
