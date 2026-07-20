@@ -14,7 +14,7 @@ from picamera2 import Picamera2
 from picamera2.encoders import MJPEGEncoder
 from picamera2.outputs import FileOutput
 import pigpio
-from classify import classify_pil, classify_pil_gemini
+from classify import classify_pil, classify_pil_gemini, EWASTE
 
 try:
     import board
@@ -26,6 +26,12 @@ except ImportError:  # pragma: no cover - optional dependency for auto-trigger
     adafruit_vl53l1x = None
 
 SERVO_PIN = 18
+# Warning LED for rejected e-waste (battery / electronics). Wired to a Pi GPIO
+# pin exactly like the servo -- LED + resistor from this pin to ground. Change
+# this if you wired the LED to a different pin.
+# GPIO16 = physical pin 36, on the bottom row of the 40-pin header.
+LED_PIN = 16
+LED_BLINK_INTERVAL = 0.25  # seconds on / off while the e-waste alert is active
 PORT = 8000
 HOME_US = 1500
 RECYCLE_US = 1850
@@ -43,6 +49,10 @@ pi = pigpio.pi()
 if not pi.connected:
     raise RuntimeError("Could not connect to pigpiod. Start it with: sudo pigpiod")
 
+# e-waste warning LED: drive it low (off) to start.
+pi.set_mode(LED_PIN, pigpio.OUTPUT)
+pi.write(LED_PIN, 0)
+
 classify_lock = Lock()
 auto_armed = True
 present_streak = 0
@@ -55,6 +65,11 @@ sensor_delta_pct = None
 sort_active = False
 baseline_distance_mm = None
 tof_sensor = None
+
+# e-waste rejection: when the classifier spots a battery/electronics we refuse
+# to sort it (servo stays home) and blink the warning LED until it's cleared.
+ewaste_alert = False
+ewaste_item = None
 
 # Which classifier the SORT button / auto-trigger uses.
 # False = on-device WasteNet (default, offline). True = Gemini + Philadelphia rules.
@@ -69,20 +84,25 @@ def _set_engine(gemini_on):
 
 
 def _run_classifier(image):
-    """Pick the active engine. Returns (label, score, is_recycle, reason, engine).
+    """Pick the active engine. Returns
+    (label, score, is_recycle, reason, engine, is_ewaste).
     If Gemini is on but fails, fall back to the on-device model so a demo never
     hard-stops."""
     global gemini_error
     if use_gemini:
         try:
-            label, score, is_recycle, reason = classify_pil_gemini(image)
+            label, score, is_recycle, reason, is_ewaste = classify_pil_gemini(image)
             gemini_error = None
-            return label, score, is_recycle, reason, "gemini"
+            return label, score, is_recycle, reason, "gemini", is_ewaste
         except Exception as exc:  # network down, missing key/package, etc.
             gemini_error = str(exc)
             print(f"Gemini classify failed, using on-device model instead: {exc}")
     label, score, is_recycle = classify_pil(image)
-    return label, score, is_recycle, "", "local"
+    # the on-device WasteNet model has a "battery" class -- treat it as e-waste.
+    is_ewaste = label in EWASTE
+    if is_ewaste:
+        is_recycle = False
+    return label, score, is_recycle, "", "local", is_ewaste
 
 
 def _read_sensor_distance_mm():
@@ -151,12 +171,15 @@ def _arm_auto_from_sensor():
 def _classify_frame(frame, source):
     with classify_lock:
         image = Image.open(io.BytesIO(frame))
-        label, score, is_recycle, reason, engine = _run_classifier(image)
+        label, score, is_recycle, reason, engine, is_ewaste = _run_classifier(image)
 
+    if is_ewaste:
+        bucket = "E-WASTE (rejected)"
+    else:
+        bucket = "RECYCLE" if is_recycle else "TRASH"
     tail = f" | {reason}" if reason else ""
-    print(f"{source} SORT [{engine}] -> {label} ({score:.0%}) "
-          f"{'RECYCLE' if is_recycle else 'TRASH'}{tail}")
-    return label, score, is_recycle, reason, engine
+    print(f"{source} SORT [{engine}] -> {label} ({score:.0%}) {bucket}{tail}")
+    return label, score, is_recycle, reason, engine, is_ewaste
 
 
 def _sort_frame(frame, source):
@@ -164,9 +187,9 @@ def _sort_frame(frame, source):
     sort_active = True
     status_text = f"{source} sorting..."
     try:
-        label, score, is_recycle, reason, engine = _classify_frame(frame, source)
-        Thread(target=move_servo, args=(is_recycle,), daemon=True).start()
-        return label, score, is_recycle, reason, engine
+        label, score, is_recycle, reason, engine, is_ewaste = _classify_frame(frame, source)
+        _act_on_result(label, is_recycle, is_ewaste)
+        return label, score, is_recycle, reason, engine, is_ewaste
     finally:
         sort_active = False
 
@@ -228,6 +251,9 @@ def _auto_monitor():
         elif not auto_armed and absent_streak >= ABSENT_CONFIRMATIONS:
             auto_armed = True
             sensor_state = "rearmed"
+            # platform is empty again -> whatever was there (incl. rejected
+            # e-waste) has been removed, so stop the warning LED.
+            _clear_ewaste_alert()
             status_text = f"AUTO re-armed at {distance_mm:.1f} mm"
             present_streak = 0
             absent_streak = 0
@@ -240,6 +266,52 @@ def move_servo(is_recycle):
     pi.set_servo_pulsewidth(SERVO_PIN, pulsewidth)
     sleep(2.0)
     pi.set_servo_pulsewidth(SERVO_PIN, HOME_US)
+
+
+def _led_blinker():
+    """Background thread: blink the warning LED while an e-waste alert is active,
+    keep it off otherwise. Runs for the life of the process."""
+    led_on = False
+    while True:
+        if ewaste_alert:
+            led_on = not led_on
+            pi.write(LED_PIN, 1 if led_on else 0)
+            sleep(LED_BLINK_INTERVAL)
+        else:
+            if led_on:
+                led_on = False
+                pi.write(LED_PIN, 0)
+            sleep(0.05)
+
+
+def _raise_ewaste_alert(item):
+    """Flag rejected e-waste: start the blinking LED and hold the servo at home
+    (we refuse to sort a battery into either bin)."""
+    global ewaste_alert, ewaste_item, status_text
+    ewaste_alert = True
+    ewaste_item = item
+    status_text = f"E-WASTE REJECTED: {item} -- remove it, take to e-waste drop-off"
+    pi.set_servo_pulsewidth(SERVO_PIN, HOME_US)  # stay centered, don't sort
+    print(f"E-WASTE DETECTED: {item} -> LED blinking, servo held at HOME")
+
+
+def _clear_ewaste_alert():
+    """Stop the warning LED (item removed / replaced with something sortable)."""
+    global ewaste_alert, ewaste_item
+    if ewaste_alert:
+        print("E-waste alert cleared")
+    ewaste_alert = False
+    ewaste_item = None
+
+
+def _act_on_result(label, is_recycle, is_ewaste):
+    """Decide what the hardware does with a classification: blink-and-hold for
+    e-waste, otherwise clear any prior alert and drive the sorting servo."""
+    if is_ewaste:
+        _raise_ewaste_alert(label)
+    else:
+        _clear_ewaste_alert()
+        Thread(target=move_servo, args=(is_recycle,), daemon=True).start()
 
 # --- the web page ---
 PAGE = """<!doctype html>
@@ -264,12 +336,23 @@ button:active{background:#1b5e20}
 .reason{font-size:19px;color:#cfd8dc;min-height:26px;margin-top:4px;font-style:italic}
 .sensor{margin:16px auto 0;max-width:520px;padding:12px 14px;border:1px solid #333;border-radius:12px;background:#171717;text-align:left;font-size:16px;line-height:1.5}
 .sensor strong{color:#fff}
+.ewaste{display:none;margin:14px auto 0;max-width:520px;padding:16px;border-radius:12px;background:#b71c1c;color:#fff;font-size:23px;font-weight:bold;animation:ewasteblink 0.5s steps(1,end) infinite}
+.ewaste.show{display:block}
+.ewaste small{display:block;font-size:15px;font-weight:normal;margin-top:6px}
+.clearbtn{background:#455a64}
+.clearbtn:active{background:#263238}
+@keyframes ewasteblink{50%{background:#3b0000}}
 </style></head>
 <body>
 <h1>Trash vs Recycle</h1>
 <img src="/stream.mjpg">
 <div><button onclick="sort()">SORT</button></div>
 <div><button onclick="armAuto()">ARM AUTO</button></div>
+<div id="ewaste" class="ewaste">⛔ E-WASTE DETECTED — DO NOT RECYCLE
+<small id="ewasteItem"></small>
+<small>Remove it and take it to an e-waste / hazardous-waste drop-off. The warning LED is blinking.</small>
+<div><button class="clearbtn" onclick="clearAlert()">CLEAR ALERT</button></div>
+</div>
 <div class="engine">
 <label class="switch"><input type="checkbox" id="geminiToggle" onchange="setEngine()"> <span>🤖 Use Gemini 3 + Philadelphia rules</span></label>
 <div id="engineNote" class="enginenote local">📟 ACTIVE: On-device ensemble (WasteNet + ONNX)</div>
@@ -295,12 +378,27 @@ r.className='thinking';
 r.textContent='📸 SNAP! thinking...';
 reason.textContent='';
 fetch('/sort').then(x=>x.json()).then(d=>{
+if(d.is_ewaste){
+r.className='trash';
+r.textContent='⛔ E-WASTE — '+d.label+' (rejected, not sorted)';
+showEwaste(true, d.label);
+}else{
 r.className = d.is_recycle ? 'recycle' : 'trash';
 r.textContent = (d.is_recycle?'♻️ RECYCLE':'🗑️ TRASH') + ' — '+d.label+' ('+Math.round(d.score*100)+'%)';
+showEwaste(false);
+}
 var wantGemini=document.getElementById('geminiToggle').checked;
 var tag = d.engine==='gemini' ? 'Gemini · Philly rules' : (wantGemini ? '⚠️ Gemini failed → on-device' : 'on-device ensemble');
 reason.textContent = d.reason ? ('“'+d.reason+'”  ·  '+tag) : tag;
 }).catch(e=>{r.className='trash';r.textContent='error: '+e;});
+}
+function showEwaste(on, item){
+var b=document.getElementById('ewaste');
+if(on){b.classList.add('show');document.getElementById('ewasteItem').textContent = item ? ('Detected: '+item) : '';}
+else{b.classList.remove('show');}
+}
+function clearAlert(){
+fetch('/clear').then(x=>x.json()).then(d=>{showEwaste(false);}).catch(e=>{});
 }
 function applyEngineBadge(engine, err){
 var note=document.getElementById('engineNote');
@@ -341,6 +439,7 @@ document.getElementById('deltaPctValue').textContent=d.sensor_delta_pct == null 
 document.getElementById('armedValue').textContent=d.auto_armed ? 'yes' : 'no';
 document.getElementById('presentValue').textContent=d.present_streak;
 document.getElementById('absentValue').textContent=d.absent_streak;
+showEwaste(d.ewaste_alert, d.ewaste_item);
 }).catch(()=>{});
 }
 setInterval(refreshStatus, 500);
@@ -398,13 +497,14 @@ class Handler(server.BaseHTTPRequestHandler):
             if frame is None:
                 image = picam2.capture_image("main")
                 with classify_lock:
-                    label, score, is_recycle, reason, engine = _run_classifier(image)
+                    label, score, is_recycle, reason, engine, is_ewaste = _run_classifier(image)
             else:
-                label, score, is_recycle, reason, engine = _classify_frame(frame, "MANUAL")
+                label, score, is_recycle, reason, engine, is_ewaste = _classify_frame(frame, "MANUAL")
             data = json.dumps({
                 "label": label,
                 "score": score,
                 "is_recycle": is_recycle,
+                "is_ewaste": is_ewaste,
                 "reason": reason,
                 "engine": engine,
             }).encode()
@@ -413,7 +513,7 @@ class Handler(server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", len(data))
             self.end_headers()
             self.wfile.write(data)
-            Thread(target=move_servo, args=(is_recycle,), daemon=True).start()
+            _act_on_result(label, is_recycle, is_ewaste)
         elif self.path.startswith("/engine"):
             params = parse_qs(urlparse(self.path).query)
             engine = _set_engine(params.get("use", ["local"])[0] == "gemini")
@@ -435,6 +535,14 @@ class Handler(server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", len(data))
             self.end_headers()
             self.wfile.write(data)
+        elif self.path == "/clear":
+            _clear_ewaste_alert()
+            data = json.dumps({"ewaste_alert": ewaste_alert, "status": status_text}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", len(data))
+            self.end_headers()
+            self.wfile.write(data)
         elif self.path == "/status":
             data = json.dumps({
                 "status": status_text,
@@ -448,6 +556,8 @@ class Handler(server.BaseHTTPRequestHandler):
                 "absent_streak": absent_streak,
                 "engine": "gemini" if use_gemini else "local",
                 "gemini_error": gemini_error,
+                "ewaste_alert": ewaste_alert,
+                "ewaste_item": ewaste_item,
             }).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -497,10 +607,12 @@ if __name__ == "__main__":
     print(f"White balance locked at gains {awb_gains}")
 
     Thread(target=_auto_monitor, daemon=True).start()
+    Thread(target=_led_blinker, daemon=True).start()
     print(f"\n LIVE! open this on your Mac browser: http://10.103.210.108:{PORT}\n")
     try:
         StreamingServer(("", PORT), Handler).serve_forever()
     finally:
+        pi.write(LED_PIN, 0)  # make sure the warning LED is off on exit
         if tof_sensor is not None:
             tof_sensor.stop_ranging()
         picam2.stop_recording()

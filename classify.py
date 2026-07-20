@@ -56,6 +56,12 @@ RECYCLE = {
     "white-glass",
 }
 
+# e-waste: batteries and electronics must NEVER go in curbside recycling or the
+# regular trash -- they get flagged for separate hazardous-waste disposal and
+# trip the warning LED. These are the on-device WasteNet labels that count as
+# e-waste; the Gemini path flags e-waste directly via its is_ewaste field.
+EWASTE = {"battery"}
+
 # if the model isn't at least this confident, call it TRASH.
 # (correct guesses come back ~95%+, bad guesses come back low -> this catches them)
 CONFIDENCE = 0.60
@@ -395,11 +401,20 @@ PHILADELPHIA DOES NOT ACCEPT (TRASH):
 - Plastics #3, #4, #6, #7 -- including Styrofoam/polystyrene foam and packing peanuts.
 - Food-soiled or greasy paper/cardboard (greasy pizza boxes, used paper plates, \
 napkins, tissues, paper towels).
-- Batteries, electronics, cords.
 - Needles and syringes.
 - Clothing, hangers, textiles, shoes.
 - Pots, pans, ceramics, drinking glasses, mirrors, wood.
 - Food, liquid, or any organic waste.
+
+E-WASTE -- SPECIAL HANDLING (set is_ewaste=true):
+- Batteries of ANY kind (AA/AAA/9V, button/coin cells, lithium, car, power banks), \
+phones, tablets, laptops, chargers, power adapters, power cords, cables, \
+headphones/earbuds, light bulbs, and any small electronic device or ANYTHING that \
+contains a battery, plug, or circuit board.
+- E-waste is NEVER curbside-recyclable and is NOT regular trash. If the object is \
+e-waste, set is_ewaste=true AND is_recycle=false. It must go to a hazardous-waste / \
+e-waste drop-off. Say so briefly in the reason (e.g. "Battery -- e-waste, take to \
+drop-off, never curbside").
 
 DECISION RULES:
 - Call it RECYCLE only if it clearly matches an accepted Philadelphia category AND \
@@ -425,13 +440,14 @@ def _get_gemini_client():
 
 def classify_pil_gemini(image):
     """Classify a PIL image with Gemini under Philadelphia rules.
-    Returns (label, score, is_recycle, reason)."""
+    Returns (label, score, is_recycle, reason, is_ewaste)."""
     from google.genai import types
     from pydantic import BaseModel
 
     class Verdict(BaseModel):
         item: str
         is_recycle: bool
+        is_ewaste: bool
         reason: str
         confidence: float
 
@@ -452,7 +468,11 @@ def classify_pil_gemini(image):
         ),
     )
     verdict = response.parsed
-    return verdict.item, float(verdict.confidence), bool(verdict.is_recycle), verdict.reason
+    is_ewaste = bool(verdict.is_ewaste)
+    # e-waste is never recyclable -- enforce it here so a stray true can't leak
+    # a battery into the recycling stream.
+    is_recycle = bool(verdict.is_recycle) and not is_ewaste
+    return verdict.item, float(verdict.confidence), is_recycle, verdict.reason, is_ewaste
 
 
 if __name__ == "__main__":

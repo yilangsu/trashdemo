@@ -131,3 +131,21 @@ After the one-time `pip install` and first run, the Pi runs 100% offline.
 
 The external ground and Pi ground MUST be connected together, or the servo just twitches.
 Servo turning the wrong way? Swap `.max()` and `.min()` in `demo.py`.
+
+> Note: `live.py` (the web-UI demo) drives the servo signal on **GPIO18**, not GPIO17.
+
+## E-waste warning LED (live.py)
+
+`live.py` rejects e-waste. When the classifier sees a **battery or electronics**,
+it refuses to sort it (servo stays centered) and **blinks a warning LED** until the
+item is removed. The Gemini + Philadelphia path flags e-waste directly; the
+on-device model catches its `battery` class.
+
+| LED wire | Connect to |
+|---|---|
+| Long leg (anode, +) | Pi **GPIO16** (physical pin 36, bottom row) → 220–330 Ω resistor → LED |
+| Short leg (cathode, −) | Pi GND (e.g. physical pin 34, right next to it) |
+
+Change the pin with `LED_PIN` at the top of `live.py`. The alert clears when the
+ToF sensor sees the platform empty again (auto mode), when the next non-e-waste
+item is sorted, or via the **CLEAR ALERT** button on the web page.
