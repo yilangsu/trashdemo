@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+
+# large model weights (exceed GitHub's 100MB file limit)
+model/pytorch_model.bin
+model/model.onnx.data
+
+# vendored pigpio library (source archive + extracted build tree)
+v79.tar.gz
+pigpio-79/
