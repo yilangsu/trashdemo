@@ -24,6 +24,30 @@ inference — see install steps below.
 GitHub into `./model/`. Run `python3 classify.py test.jpg` once while online so
 the files are cached before going offline for the actual demo.
 
+## Gemini mode — Philadelphia-specific rules (optional, in the web UI)
+
+The on-device WasteNet model above is the default. `live.py`'s web page also has
+a toggle — **"🤖 Use Gemini 3 + Philadelphia rules"** — that switches the SORT
+button (and the auto-trigger) over to Google Gemini with a system prompt built
+from the City of Philadelphia's official curbside recycling rules
+([phila.gov](https://www.phila.gov/programs/recycling-program/what-to-recycle/)):
+plastics **#1/#2/#5 only**, clean pizza boxes yes / greasy no, no plastic bags,
+no Styrofoam, etc. Gemini also returns a short reason, shown under the result —
+so it's genuinely location-specific, not generic recycling advice.
+
+Setup:
+```
+pip install google-genai
+export GEMINI_API_KEY=your_key_here
+# optional: pin the exact model id (confirm it in aistudio.google.com)
+export GEMINI_MODEL=gemini-3-flash
+python live.py
+```
+Then flip the toggle on the page. The prompt lives in `PHILLY_SYSTEM_PROMPT`
+in `classify.py`. If a Gemini call fails (no key, no network), it automatically
+falls back to the on-device model so the demo never hard-stops, and the page
+shows the error under the toggle.
+
 ## Faster inference (fallback path only)
 The WasteNet TFLite model above is the primary, fast path and needs none of this.
 The notes below only apply if you're on the older PyTorch/ONNX fallback (used when

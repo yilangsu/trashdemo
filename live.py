@@ -8,12 +8,13 @@ import socketserver
 from http import server
 from threading import Condition, Lock, Thread
 from time import monotonic, sleep
+from urllib.parse import parse_qs, urlparse
 from PIL import Image
 from picamera2 import Picamera2
 from picamera2.encoders import MJPEGEncoder
 from picamera2.outputs import FileOutput
 import pigpio
-from classify import classify_pil
+from classify import classify_pil, classify_pil_gemini
 
 try:
     import board
@@ -54,6 +55,34 @@ sensor_delta_pct = None
 sort_active = False
 baseline_distance_mm = None
 tof_sensor = None
+
+# Which classifier the SORT button / auto-trigger uses.
+# False = on-device WasteNet (default, offline). True = Gemini + Philadelphia rules.
+use_gemini = False
+gemini_error = None
+
+
+def _set_engine(gemini_on):
+    global use_gemini
+    use_gemini = bool(gemini_on)
+    return "gemini" if use_gemini else "local"
+
+
+def _run_classifier(image):
+    """Pick the active engine. Returns (label, score, is_recycle, reason, engine).
+    If Gemini is on but fails, fall back to the on-device model so a demo never
+    hard-stops."""
+    global gemini_error
+    if use_gemini:
+        try:
+            label, score, is_recycle, reason = classify_pil_gemini(image)
+            gemini_error = None
+            return label, score, is_recycle, reason, "gemini"
+        except Exception as exc:  # network down, missing key/package, etc.
+            gemini_error = str(exc)
+            print(f"Gemini classify failed, using on-device model instead: {exc}")
+    label, score, is_recycle = classify_pil(image)
+    return label, score, is_recycle, "", "local"
 
 
 def _read_sensor_distance_mm():
@@ -122,10 +151,12 @@ def _arm_auto_from_sensor():
 def _classify_frame(frame, source):
     with classify_lock:
         image = Image.open(io.BytesIO(frame))
-        label, score, is_recycle = classify_pil(image)
+        label, score, is_recycle, reason, engine = _run_classifier(image)
 
-    print(f"{source} SORT -> {label} ({score:.0%}) {'RECYCLE' if is_recycle else 'TRASH'}")
-    return label, score, is_recycle
+    tail = f" | {reason}" if reason else ""
+    print(f"{source} SORT [{engine}] -> {label} ({score:.0%}) "
+          f"{'RECYCLE' if is_recycle else 'TRASH'}{tail}")
+    return label, score, is_recycle, reason, engine
 
 
 def _sort_frame(frame, source):
@@ -133,9 +164,9 @@ def _sort_frame(frame, source):
     sort_active = True
     status_text = f"{source} sorting..."
     try:
-        label, score, is_recycle = _classify_frame(frame, source)
+        label, score, is_recycle, reason, engine = _classify_frame(frame, source)
         Thread(target=move_servo, args=(is_recycle,), daemon=True).start()
-        return label, score, is_recycle
+        return label, score, is_recycle, reason, engine
     finally:
         sort_active = False
 
@@ -223,6 +254,11 @@ button:active{background:#1b5e20}
 #result{font-size:34px;font-weight:bold;min-height:50px;margin-top:8px}
 .recycle{color:#4caf50}.trash{color:#ff5252}.thinking{color:#ffb300}
 .status{font-size:18px;color:#bbb;min-height:24px;margin-top:4px}
+.engine{margin:10px auto 0;max-width:520px}
+.switch{display:inline-flex;align-items:center;gap:10px;font-size:18px;cursor:pointer;user-select:none}
+.switch input{width:22px;height:22px}
+.enginenote{font-size:15px;color:#9ad;margin-top:6px}
+.reason{font-size:19px;color:#cfd8dc;min-height:26px;margin-top:4px;font-style:italic}
 .sensor{margin:16px auto 0;max-width:520px;padding:12px 14px;border:1px solid #333;border-radius:12px;background:#171717;text-align:left;font-size:16px;line-height:1.5}
 .sensor strong{color:#fff}
 </style></head>
@@ -231,7 +267,12 @@ button:active{background:#1b5e20}
 <img src="/stream.mjpg">
 <div><button onclick="sort()">SORT</button></div>
 <div><button onclick="armAuto()">ARM AUTO</button></div>
+<div class="engine">
+<label class="switch"><input type="checkbox" id="geminiToggle" onchange="setEngine()"> <span>🤖 Use Gemini 3 + Philadelphia rules</span></label>
+<div id="engineNote" class="enginenote">📟 On-device model (WasteNet)</div>
+</div>
 <div id="result">Hold an object in view, then hit SORT</div>
+<div id="reason" class="reason"></div>
 <div id="status">AUTO not armed</div>
 <div class="sensor">
     <div><strong>State:</strong> <span id="sensorState">idle</span></div>
@@ -246,12 +287,23 @@ button:active{background:#1b5e20}
 <script>
 function sort(){
 var r=document.getElementById('result');
+var reason=document.getElementById('reason');
 r.className='thinking';
 r.textContent='📸 SNAP! thinking...';
+reason.textContent='';
 fetch('/sort').then(x=>x.json()).then(d=>{
 r.className = d.is_recycle ? 'recycle' : 'trash';
 r.textContent = (d.is_recycle?'♻️ RECYCLE':'🗑️ TRASH') + ' — '+d.label+' ('+Math.round(d.score*100)+'%)';
+reason.textContent = d.reason ? ('“'+d.reason+'”  ·  '+(d.engine==='gemini'?'Gemini · Philly rules':'on-device')) : '';
 }).catch(e=>{r.className='trash';r.textContent='error: '+e;});
+}
+function setEngine(){
+var on=document.getElementById('geminiToggle').checked;
+var note=document.getElementById('engineNote');
+note.textContent = on ? 'switching to Gemini…' : 'switching to on-device model…';
+fetch('/engine?use=' + (on?'gemini':'local')).then(x=>x.json()).then(d=>{
+note.textContent = d.engine==='gemini' ? '☁️ Gemini 3 + Philadelphia rules (cloud)' : '📟 On-device model (WasteNet)';
+}).catch(e=>{note.textContent='error: '+e;});
 }
 function armAuto(){
 var s=document.getElementById('status');
@@ -261,6 +313,14 @@ fetch('/arm').then(x=>x.json()).then(d=>{s.textContent=d.status;}).catch(e=>{s.t
 function refreshStatus(){
 fetch('/status').then(x=>x.json()).then(d=>{
 document.getElementById('status').textContent=d.status;
+if(d.engine){
+var note=document.getElementById('engineNote');
+if(d.engine==='gemini'){
+note.textContent = d.gemini_error ? ('⚠️ Gemini failed, using on-device — '+d.gemini_error) : '☁️ Gemini 3 + Philadelphia rules (cloud)';
+}else{
+note.textContent = '📟 On-device model (WasteNet)';
+}
+}
 document.getElementById('sensorState').textContent=d.sensor_state ?? 'idle';
 document.getElementById('baselineValue').textContent=d.baseline_distance_mm == null ? '-' : Math.round(d.baseline_distance_mm) + ' mm';
 document.getElementById('distanceValue').textContent=d.sensor_distance_mm == null ? '-' : Math.round(d.sensor_distance_mm) + ' mm';
@@ -323,16 +383,31 @@ class Handler(server.BaseHTTPRequestHandler):
             if frame is None:
                 image = picam2.capture_image("main")
                 with classify_lock:
-                    label, score, is_recycle = classify_pil(image)
+                    label, score, is_recycle, reason, engine = _run_classifier(image)
             else:
-                label, score, is_recycle = _classify_frame(frame, "MANUAL")
-            data = json.dumps({"label": label, "score": score, "is_recycle": is_recycle}).encode()
+                label, score, is_recycle, reason, engine = _classify_frame(frame, "MANUAL")
+            data = json.dumps({
+                "label": label,
+                "score": score,
+                "is_recycle": is_recycle,
+                "reason": reason,
+                "engine": engine,
+            }).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", len(data))
             self.end_headers()
             self.wfile.write(data)
             Thread(target=move_servo, args=(is_recycle,), daemon=True).start()
+        elif self.path.startswith("/engine"):
+            params = parse_qs(urlparse(self.path).query)
+            engine = _set_engine(params.get("use", ["local"])[0] == "gemini")
+            data = json.dumps({"engine": engine, "gemini_error": gemini_error}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", len(data))
+            self.end_headers()
+            self.wfile.write(data)
         elif self.path == "/arm":
             if tof_sensor is None:
                 status = "VL53L1X not available"
@@ -356,6 +431,8 @@ class Handler(server.BaseHTTPRequestHandler):
                 "auto_armed": auto_armed,
                 "present_streak": present_streak,
                 "absent_streak": absent_streak,
+                "engine": "gemini" if use_gemini else "local",
+                "gemini_error": gemini_error,
             }).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")

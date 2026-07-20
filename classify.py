@@ -5,6 +5,7 @@ Test it today: put a photo of trash/a bottle next to this file and run:
     pip install pillow numpy requests
     python classify.py test.jpg
 """
+import io
 import json
 import os
 from urllib.request import urlretrieve
@@ -292,6 +293,123 @@ def classify_pil(image):
 def classify(image_path):
     """Returns (label, score, is_recycle)."""
     return classify_pil(Image.open(image_path))
+
+
+# ---------------------------------------------------------------------------
+# Cloud classifier: Google Gemini + Philadelphia-specific recycling rules.
+# Optional path, enabled from the web UI toggle in live.py. The on-device
+# WasteNet model stays the default; this only runs when explicitly turned on.
+#   Requires:  pip install google-genai   and   GEMINI_API_KEY in the env.
+# ---------------------------------------------------------------------------
+
+def _load_dotenv():
+    """Minimal .env loader (no extra dependency). Reads KEY=value lines from a
+    .env file next to this script into the environment. A real shell env var
+    (e.g. an exported GEMINI_API_KEY) always wins over the file."""
+    env_path = os.path.join(_HERE, ".env")
+    if not os.path.isfile(env_path):
+        return
+    with open(env_path, "r", encoding="utf-8") as handle:
+        for raw in handle:
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+_load_dotenv()
+
+# Confirm the exact model id in Google AI Studio (aistudio.google.com). You can
+# swap it without touching code: set GEMINI_MODEL in .env or export it.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3-flash")
+
+# Location-specific rules straight from the City of Philadelphia's curbside
+# single-stream program (phila.gov/programs/recycling-program/what-to-recycle).
+# This is what makes the decision "Philadelphia-specific" rather than generic.
+PHILLY_SYSTEM_PROMPT = """You are the sorting brain for an automated trash/recycling \
+bin located in PHILADELPHIA, Pennsylvania. Follow the City of Philadelphia's official \
+curbside single-stream recycling rules EXACTLY -- not generic or national guidance.
+
+You are shown ONE photo of ONE object being dropped into the bin. Decide whether it \
+belongs in RECYCLE or TRASH under Philadelphia's rules, then answer.
+
+PHILADELPHIA ACCEPTS (RECYCLE) -- only if empty, rinsed, and dry:
+- Paper: newspaper, magazines, catalogs, junk mail, envelopes, writing/scrap paper, \
+paper bags, paper cups, phone books, paperback books, greeting cards, non-metallic \
+wrapping paper.
+- Cardboard (flattened, free of grease and food): corrugated shipping boxes, CLEAN \
+pizza boxes, paper towel/toilet rolls, cardboard egg cartons, dry food boxes.
+- Cartons: milk, juice, wine, and soup cartons.
+- Glass: all bottles and jars (lids/caps on).
+- Metal: aluminum/steel/tin cans, empty paint cans, empty aerosol cans, aluminum \
+baking trays, jar lids and bottle caps on empty containers.
+- Plastics #1, #2, and #5 ONLY: bottles, jugs, cups, tubs, food/beverage and takeout \
+containers, detergent/shampoo bottles, pump/spray bottles (lids/caps on).
+
+PHILADELPHIA DOES NOT ACCEPT (TRASH):
+- Plastic bags and any plastic film or wrap.
+- Plastics #3, #4, #6, #7 -- including Styrofoam/polystyrene foam and packing peanuts.
+- Food-soiled or greasy paper/cardboard (greasy pizza boxes, used paper plates, \
+napkins, tissues, paper towels).
+- Batteries, electronics, cords.
+- Needles and syringes.
+- Clothing, hangers, textiles, shoes.
+- Pots, pans, ceramics, drinking glasses, mirrors, wood.
+- Food, liquid, or any organic waste.
+
+DECISION RULES:
+- Call it RECYCLE only if it clearly matches an accepted Philadelphia category AND \
+looks empty/clean enough not to contaminate the batch.
+- Contaminated recyclables (food residue, liquid still inside, grease) are TRASH.
+- When genuinely unsure, choose TRASH -- one dirty item can spoil a whole batch \
+("when in doubt, throw it out").
+- If you cannot identify the object, choose TRASH with low confidence.
+
+Keep the reason short (max ~15 words), plain enough to read off a screen, and cite \
+the Philly rule (e.g. "Empty #1 plastic bottle -- Philly takes #1/#2/#5")."""
+
+_gemini_client = None
+
+
+def _get_gemini_client():
+    global _gemini_client
+    if _gemini_client is None:
+        from google import genai  # lazy import: only needed when Gemini is enabled
+        _gemini_client = genai.Client()  # reads GEMINI_API_KEY / GOOGLE_API_KEY
+    return _gemini_client
+
+
+def classify_pil_gemini(image):
+    """Classify a PIL image with Gemini under Philadelphia rules.
+    Returns (label, score, is_recycle, reason)."""
+    from google.genai import types
+    from pydantic import BaseModel
+
+    class Verdict(BaseModel):
+        item: str
+        is_recycle: bool
+        reason: str
+        confidence: float
+
+    buffer = io.BytesIO()
+    image.convert("RGB").save(buffer, format="JPEG", quality=85)
+
+    client = _get_gemini_client()
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=[
+            types.Part.from_bytes(data=buffer.getvalue(), mime_type="image/jpeg"),
+            "Recycle or trash under Philadelphia curbside rules? Explain briefly.",
+        ],
+        config=types.GenerateContentConfig(
+            system_instruction=PHILLY_SYSTEM_PROMPT,
+            response_mime_type="application/json",
+            response_schema=Verdict,
+        ),
+    )
+    verdict = response.parsed
+    return verdict.item, float(verdict.confidence), bool(verdict.is_recycle), verdict.reason
 
 
 if __name__ == "__main__":

@@ -1,6 +1,9 @@
 __pycache__/
 *.pyc
 
+# secrets — API keys go here, never committed
+.env
+
 # large model weights (exceed GitHub's 100MB file limit)
 model/pytorch_model.bin
 model/model.onnx.data
