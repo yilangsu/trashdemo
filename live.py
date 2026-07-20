@@ -342,7 +342,10 @@ class StreamingOutput(io.BufferedIOBase):
 
     def write(self, buf):
         with self.condition:
-            self.frame = buf
+            # buf is a memoryview into the encoder's DMA buffer, which gets
+            # recycled for the next frame as soon as this call returns -- copy
+            # it now or later readers of self.frame get stale/torn data.
+            self.frame = bytes(buf)
             self.condition.notify_all()
 
 output = StreamingOutput()
@@ -471,6 +474,16 @@ if __name__ == "__main__":
     picam2 = Picamera2()
     picam2.configure(picam2.create_video_configuration(main={"size": (640, 480)}))
     picam2.start_recording(MJPEGEncoder(), FileOutput(output))
+
+    # Let auto white balance converge on the (usually empty) bin under our
+    # fixed lighting, then freeze it. Auto white balance re-guessing per shot
+    # is what pushes reflective/metallic items toward a warm, cardboard-ish
+    # color cast.
+    sleep(1.0)
+    awb_gains = picam2.capture_metadata().get("ColourGains", (1.0, 1.0))
+    picam2.set_controls({"AwbEnable": False, "ColourGains": awb_gains})
+    print(f"White balance locked at gains {awb_gains}")
+
     Thread(target=_auto_monitor, daemon=True).start()
     print(f"\n LIVE! open this on your Mac browser: http://10.103.210.108:{PORT}\n")
     try:

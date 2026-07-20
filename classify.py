@@ -60,6 +60,18 @@ RECYCLE = {
 # (correct guesses come back ~95%+, bad guesses come back low -> this catches them)
 CONFIDENCE = 0.60
 
+# maps WasteNet's 12 classes down to the ONNX model's 6, so the two can be
+# compared for agreement.
+_WASTENET_TO_COARSE = {
+    "brown-glass": "glass",
+    "green-glass": "glass",
+    "white-glass": "glass",
+    "battery": "trash",
+    "biological": "trash",
+    "clothes": "trash",
+    "shoes": "trash",
+}
+
 # WasteNet model and labels from the upstream GitHub repo.
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _LOCAL = os.path.join(_HERE, "model")
@@ -217,10 +229,7 @@ def _get_runtime():
 
     if _model is None:
         if AutoModelForImageClassification is None or torch is None:
-            raise RuntimeError(
-                "PyTorch and transformers are required for inference. "
-                "Install them with: pip install torch transformers pillow"
-            )
+            return None, None
         print("Loading model from local disk...")
         model = AutoModelForImageClassification.from_pretrained(MODEL)
         model.eval()
@@ -228,65 +237,98 @@ def _get_runtime():
     return None, _model
 
 
-def classify_pil(image):
-    """Classify a PIL image directly. Returns (label, score, is_recycle)."""
+def _classify_wastenet(image):
+    """Returns (label, score) from the WasteNet TFLite model, or None if unavailable."""
     interpreter = _get_wastenet_interpreter()
-    if interpreter is not None:
-        if np is None:
-            raise RuntimeError("numpy is required for WasteNet inference")
+    if interpreter is None:
+        return None
+    if np is None:
+        raise RuntimeError("numpy is required for WasteNet inference")
 
-        inputs = _preprocess_wastenet_image(image)
-        input_details = _tflite_input_details
-        output_details = _tflite_output_details
-        input_data = np.asarray(inputs, dtype=input_details["dtype"])
+    inputs = _preprocess_wastenet_image(image)
+    input_details = _tflite_input_details
+    output_details = _tflite_output_details
+    input_data = np.asarray(inputs, dtype=input_details["dtype"])
 
-        if np.issubdtype(input_details["dtype"], np.integer):
-            scale, zero_point = input_details.get("quantization", (0.0, 0))
-            if scale and scale > 0:
-                input_data = input_data / scale + zero_point
-            input_data = np.clip(np.rint(input_data), np.iinfo(input_details["dtype"]).min, np.iinfo(input_details["dtype"]).max).astype(input_details["dtype"])
-        else:
-            input_data = input_data.astype(np.float32)
-
-        interpreter.set_tensor(input_details["index"], input_data)
-        interpreter.invoke()
-        output = interpreter.get_tensor(output_details["index"])[0]
-
-        if output.min() < 0.0 or output.max() > 1.0 + 1e-3:
-            probabilities = np.exp(output - np.max(output))
-            probabilities = probabilities / probabilities.sum()
-        else:
-            probabilities = output
-
-        class_id = int(np.argmax(probabilities))
-        score = float(probabilities[class_id])
-        label = _load_wastenet_labels()[class_id].lower()
+    if np.issubdtype(input_details["dtype"], np.integer):
+        scale, zero_point = input_details.get("quantization", (0.0, 0))
+        if scale and scale > 0:
+            input_data = input_data / scale + zero_point
+        input_data = np.clip(np.rint(input_data), np.iinfo(input_details["dtype"]).min, np.iinfo(input_details["dtype"]).max).astype(input_details["dtype"])
     else:
-        _, runtime = _get_runtime()
-        inputs = _preprocess_image(image)
+        input_data = input_data.astype(np.float32)
 
-        if _session is not None:
-            if np is None:
-                raise RuntimeError("numpy is required for ONNX inference")
-            logits = _session.run(None, {"pixel_values": np.asarray(inputs)})[0]
-            probabilities = np.exp(logits - logits.max(axis=-1, keepdims=True))
-            probabilities = probabilities / probabilities.sum(axis=-1, keepdims=True)
-            class_id = int(probabilities.argmax(axis=-1)[0])
-            score = float(probabilities[0, class_id])
-            label_map = _load_id2label()
-            if label_map is None:
-                raise RuntimeError("model/config.json is required for ONNX label mapping")
-            label = label_map[class_id].lower()
-        else:
-            with torch.inference_mode():
-                outputs = runtime(pixel_values=inputs)
-                probabilities = outputs.logits.softmax(dim=-1)[0]
-                class_id = int(probabilities.argmax().item())
-                score = float(probabilities[class_id].item())
-            label = runtime.config.id2label[class_id].lower()
+    interpreter.set_tensor(input_details["index"], input_data)
+    interpreter.invoke()
+    output = interpreter.get_tensor(output_details["index"])[0]
 
-    # only recycle if it's a recyclable class AND the model is confident
-    is_recycle = (label in RECYCLE) and (score >= CONFIDENCE)
+    if output.min() < 0.0 or output.max() > 1.0 + 1e-3:
+        probabilities = np.exp(output - np.max(output))
+        probabilities = probabilities / probabilities.sum()
+    else:
+        probabilities = output
+
+    class_id = int(np.argmax(probabilities))
+    score = float(probabilities[class_id])
+    label = _load_wastenet_labels()[class_id].lower()
+    return label, score
+
+
+def _classify_onnx_or_torch(image):
+    """Returns (label, score) from the ONNX/torch ViT model, or None if unavailable."""
+    _, runtime = _get_runtime()
+    if runtime is None:
+        return None
+
+    inputs = _preprocess_image(image)
+
+    if _session is not None:
+        if np is None:
+            raise RuntimeError("numpy is required for ONNX inference")
+        logits = _session.run(None, {"pixel_values": np.asarray(inputs)})[0]
+        probabilities = np.exp(logits - logits.max(axis=-1, keepdims=True))
+        probabilities = probabilities / probabilities.sum(axis=-1, keepdims=True)
+        class_id = int(probabilities.argmax(axis=-1)[0])
+        score = float(probabilities[0, class_id])
+        label_map = _load_id2label()
+        if label_map is None:
+            raise RuntimeError("model/config.json is required for ONNX label mapping")
+        label = label_map[class_id].lower()
+    else:
+        with torch.inference_mode():
+            outputs = runtime(pixel_values=inputs)
+            probabilities = outputs.logits.softmax(dim=-1)[0]
+            class_id = int(probabilities.argmax().item())
+            score = float(probabilities[class_id].item())
+        label = runtime.config.id2label[class_id].lower()
+    return label, score
+
+
+def classify_pil(image):
+    """Classify a PIL image using both models as an ensemble. Returns (label, score, is_recycle)."""
+    wastenet_result = _classify_wastenet(image)
+    onnx_result = _classify_onnx_or_torch(image)
+
+    if wastenet_result is None and onnx_result is None:
+        raise RuntimeError("No classifier backend is available")
+
+    if wastenet_result is None:
+        label, score = onnx_result
+        agree = True
+    elif onnx_result is None:
+        label, score = wastenet_result
+        agree = True
+    else:
+        w_label, w_score = wastenet_result
+        o_label, o_score = onnx_result
+        agree = _WASTENET_TO_COARSE.get(w_label, w_label) == o_label
+        label, score = (w_label, w_score) if w_score >= o_score else (o_label, o_score)
+        print(f"ensemble: wastenet={w_label} ({w_score:.0%})  onnx={o_label} ({o_score:.0%})  agree={agree}")
+
+    # only recycle if both models agree, it's a recyclable class, AND the
+    # winning model is confident. Disagreement is treated as an edge case and
+    # defaults to TRASH rather than risking contaminating recycling.
+    is_recycle = agree and (label in RECYCLE) and (score >= CONFIDENCE)
     return label, score, is_recycle
 
 
