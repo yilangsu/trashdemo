@@ -712,9 +712,14 @@ if __name__ == "__main__":
             tof_sensor.start_ranging()
             print("VL53L1X ready for auto-trigger")
             Thread(target=_arm_auto_from_sensor, daemon=True).start()
-        except OSError as exc:
+        # Any sensor problem -- unplugged, miswired, wrong I2C address -- shows
+        # up here (OSError from the bus, or ValueError "No I2C device at
+        # address" when the probe finds nothing). Swallow them all so a wiring
+        # issue just disables auto-trigger instead of crashing the whole app;
+        # everything downstream already handles tof_sensor being None.
+        except Exception as exc:
             tof_sensor = None
-            print(f"VL53L1X unavailable, auto-trigger will be disabled: {exc}")
+            print(f"VL53L1X unavailable, auto-trigger disabled (sensor ignored): {exc}")
     else:
         print("VL53L1X libraries missing, auto-trigger will be unavailable")
 
