@@ -5,6 +5,7 @@ os.environ['GPIOZERO_PIN_FACTORY'] = 'pigpio'
 import io
 import json
 import socketserver
+import subprocess
 from http import server
 from threading import Condition, Lock, Thread
 from time import monotonic, sleep
@@ -32,10 +33,15 @@ SERVO_PIN = 18
 # GPIO16 = physical pin 36, on the bottom row of the 40-pin header.
 LED_PIN = 16
 LED_BLINK_INTERVAL = 0.25  # seconds on / off while the e-waste alert is active
+# Manual-sort push switch: one leg to GPIO23, the other to ground. Internal
+# pull-up keeps the pin high until pressed, so a press reads as a falling edge.
+# GPIO23 = physical pin 16.
+BUTTON_PIN = 23
+BUTTON_DEBOUNCE_US = 250000  # 250ms glitch filter to ignore switch bounce
 PORT = 8000
 HOME_US = 1500
-RECYCLE_US = 1850
-TRASH_US = 1150
+RECYCLE_US = 2200
+TRASH_US = 800
 AUTO_TRIGGER = True
 PRESENT_THRESHOLD_PCT = 20.0
 ABSENT_THRESHOLD_PCT = 8.0
@@ -52,6 +58,11 @@ if not pi.connected:
 # e-waste warning LED: drive it low (off) to start.
 pi.set_mode(LED_PIN, pigpio.OUTPUT)
 pi.write(LED_PIN, 0)
+
+# Manual-sort push switch.
+pi.set_mode(BUTTON_PIN, pigpio.INPUT)
+pi.set_pull_up_down(BUTTON_PIN, pigpio.PUD_UP)
+pi.set_glitch_filter(BUTTON_PIN, BUTTON_DEBOUNCE_US)
 
 classify_lock = Lock()
 auto_armed = True
@@ -70,6 +81,29 @@ tof_sensor = None
 # to sort it (servo stays home) and blink the warning LED until it's cleared.
 ewaste_alert = False
 ewaste_item = None
+
+# Last classification result, whatever triggered it (page SORT button, GPIO
+# button, or auto-trigger) -- /status exposes this so the page can show it
+# even when the sort didn't come from the page's own fetch('/sort') call.
+last_result_source = None
+last_result_label = None
+last_result_score = None
+last_result_is_recycle = None
+last_result_reason = None
+last_result_engine = None
+last_result_is_ewaste = None
+
+
+def _record_result(source, label, score, is_recycle, reason, engine, is_ewaste):
+    global last_result_source, last_result_label, last_result_score
+    global last_result_is_recycle, last_result_reason, last_result_engine, last_result_is_ewaste
+    last_result_source = source
+    last_result_label = label
+    last_result_score = score
+    last_result_is_recycle = is_recycle
+    last_result_reason = reason
+    last_result_engine = engine
+    last_result_is_ewaste = is_ewaste
 
 # Which classifier the SORT button / auto-trigger uses.
 # False = on-device WasteNet (default, offline). True = Gemini + Philadelphia rules.
@@ -179,6 +213,7 @@ def _classify_frame(frame, source):
         bucket = "RECYCLE" if is_recycle else "TRASH"
     tail = f" | {reason}" if reason else ""
     print(f"{source} SORT [{engine}] -> {label} ({score:.0%}) {bucket}{tail}")
+    _record_result(source, label, score, is_recycle, reason, engine, is_ewaste)
     return label, score, is_recycle, reason, engine, is_ewaste
 
 
@@ -192,6 +227,28 @@ def _sort_frame(frame, source):
         return label, score, is_recycle, reason, engine, is_ewaste
     finally:
         sort_active = False
+
+
+def _button_sort_trigger():
+    if classify_lock.locked() or sort_active:
+        return  # already mid-sort, ignore this press
+    with output.condition:
+        if output.frame is None:
+            output.condition.wait(timeout=1.0)
+        frame = output.frame
+    if frame is not None:
+        _sort_frame(frame, "BUTTON")
+    else:
+        image = picam2.capture_image("main")
+        with classify_lock:
+            label, score, is_recycle, reason, engine, is_ewaste = _run_classifier(image)
+        _record_result("BUTTON", label, score, is_recycle, reason, engine, is_ewaste)
+        _act_on_result(label, is_recycle, is_ewaste)
+
+
+def _on_button_edge(gpio, level, tick):
+    if level == 0:  # falling edge: pull-up wiring means pressed == low
+        Thread(target=_button_sort_trigger, daemon=True).start()
 
 
 def _auto_monitor():
@@ -342,12 +399,25 @@ button:active{background:#1b5e20}
 .clearbtn{background:#455a64}
 .clearbtn:active{background:#263238}
 @keyframes ewasteblink{50%{background:#3b0000}}
+.layout{display:flex;gap:28px;align-items:flex-start;justify-content:center;flex-wrap:wrap;text-align:left;max-width:1100px;margin:0 auto}
+.col-cam{flex:1 1 460px;max-width:640px;text-align:center}
+.col-status{flex:1 1 380px;max-width:520px}
+.col-status .engine{margin:10px 0 0}
+.col-status .sensor{margin:16px 0 0}
+.col-status .ewaste{margin:14px 0 0}
 </style></head>
 <body>
 <h1>Trash vs Recycle</h1>
+<div class="layout">
+<div class="col-cam">
 <img src="/stream.mjpg">
 <div><button onclick="sort()">SORT</button></div>
 <div><button onclick="armAuto()">ARM AUTO</button></div>
+</div>
+<div class="col-status">
+<div id="result">Hold an object in view, then hit SORT</div>
+<div id="reason" class="reason"></div>
+<div id="status">AUTO not armed</div>
 <div id="ewaste" class="ewaste">⛔ E-WASTE DETECTED — DO NOT RECYCLE
 <small id="ewasteItem"></small>
 <small>Remove it and take it to an e-waste / hazardous-waste drop-off. The warning LED is blinking.</small>
@@ -357,9 +427,6 @@ button:active{background:#1b5e20}
 <label class="switch"><input type="checkbox" id="geminiToggle" onchange="setEngine()"> <span>🤖 Use Gemini 3 + Philadelphia rules</span></label>
 <div id="engineNote" class="enginenote local">📟 ACTIVE: On-device ensemble (WasteNet + ONNX)</div>
 </div>
-<div id="result">Hold an object in view, then hit SORT</div>
-<div id="reason" class="reason"></div>
-<div id="status">AUTO not armed</div>
 <div class="sensor">
     <div><strong>State:</strong> <span id="sensorState">idle</span></div>
     <div><strong>Baseline:</strong> <span id="baselineValue">-</span></div>
@@ -370,8 +437,12 @@ button:active{background:#1b5e20}
     <div><strong>Present streak:</strong> <span id="presentValue">0</span></div>
     <div><strong>Absent streak:</strong> <span id="absentValue">0</span></div>
 </div>
+</div>
+</div>
 <script>
+var manualSortInFlight = false;
 function sort(){
+manualSortInFlight = true;
 var r=document.getElementById('result');
 var reason=document.getElementById('reason');
 r.className='thinking';
@@ -390,7 +461,7 @@ showEwaste(false);
 var wantGemini=document.getElementById('geminiToggle').checked;
 var tag = d.engine==='gemini' ? 'Gemini · Philly rules' : (wantGemini ? '⚠️ Gemini failed → on-device' : 'on-device ensemble');
 reason.textContent = d.reason ? ('“'+d.reason+'”  ·  '+tag) : tag;
-}).catch(e=>{r.className='trash';r.textContent='error: '+e;});
+}).catch(e=>{r.className='trash';r.textContent='error: '+e;}).then(()=>{manualSortInFlight=false;});
 }
 function showEwaste(on, item){
 var b=document.getElementById('ewaste');
@@ -440,6 +511,27 @@ document.getElementById('armedValue').textContent=d.auto_armed ? 'yes' : 'no';
 document.getElementById('presentValue').textContent=d.present_streak;
 document.getElementById('absentValue').textContent=d.absent_streak;
 showEwaste(d.ewaste_alert, d.ewaste_item);
+if(!manualSortInFlight){
+var r=document.getElementById('result');
+var reasonEl=document.getElementById('reason');
+if(d.sort_active){
+r.className='thinking';
+r.textContent='📸 SNAP! thinking...';
+reasonEl.textContent='';
+}else if(d.last_result_label){
+if(d.last_result_is_ewaste){
+r.className='trash';
+r.textContent='⛔ E-WASTE — '+d.last_result_label+' (rejected, not sorted)';
+}else{
+r.className = d.last_result_is_recycle ? 'recycle' : 'trash';
+r.textContent = (d.last_result_is_recycle?'♻️ RECYCLE':'🗑️ TRASH') + ' — '+d.last_result_label+' ('+Math.round(d.last_result_score*100)+'%)';
+}
+var wantGemini=document.getElementById('geminiToggle').checked;
+var tag = d.last_result_engine==='gemini' ? 'Gemini · Philly rules' : (wantGemini ? '⚠️ Gemini failed → on-device' : 'on-device ensemble');
+var srcTag = d.last_result_source ? (' · via '+d.last_result_source) : '';
+reasonEl.textContent = (d.last_result_reason ? ('“'+d.last_result_reason+'”  ·  '+tag) : tag) + srcTag;
+}
+}
 }).catch(()=>{});
 }
 setInterval(refreshStatus, 500);
@@ -498,6 +590,7 @@ class Handler(server.BaseHTTPRequestHandler):
                 image = picam2.capture_image("main")
                 with classify_lock:
                     label, score, is_recycle, reason, engine, is_ewaste = _run_classifier(image)
+                _record_result("MANUAL", label, score, is_recycle, reason, engine, is_ewaste)
             else:
                 label, score, is_recycle, reason, engine, is_ewaste = _classify_frame(frame, "MANUAL")
             data = json.dumps({
@@ -558,6 +651,14 @@ class Handler(server.BaseHTTPRequestHandler):
                 "gemini_error": gemini_error,
                 "ewaste_alert": ewaste_alert,
                 "ewaste_item": ewaste_item,
+                "sort_active": sort_active,
+                "last_result_source": last_result_source,
+                "last_result_label": last_result_label,
+                "last_result_score": last_result_score,
+                "last_result_is_recycle": last_result_is_recycle,
+                "last_result_reason": last_result_reason,
+                "last_result_engine": last_result_engine,
+                "last_result_is_ewaste": last_result_is_ewaste,
             }).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -573,6 +674,30 @@ class Handler(server.BaseHTTPRequestHandler):
 class StreamingServer(socketserver.ThreadingMixIn, server.HTTPServer):
     allow_reuse_address = True
     daemon_threads = True
+
+def _launch_kiosk_browser():
+    """Show the live preview full-screen on the Pi's own HDMI display."""
+    sleep(2.0)  # give the HTTP server a moment to start listening
+    env = os.environ.copy()
+    env.setdefault("DISPLAY", ":0")
+    url = f"http://localhost:{PORT}/"
+    try:
+        # Chromium runs as a singleton: relaunching it while a kiosk window is
+        # already open just focuses that window instead of reloading it, so
+        # code changes never show up on screen. Kill any running instance
+        # first so we always get a fresh page load.
+        subprocess.run(["pkill", "-x", "chromium"], env=env)
+        sleep(0.5)
+        subprocess.Popen([
+            "chromium", "--kiosk", "--noerrdialogs", "--disable-infobars",
+            "--no-first-run", "--disable-session-crashed-bubble",
+            "--disable-features=TranslateUI", "--password-store=basic",
+            "--force-device-scale-factor=0.75",
+            url,
+        ], env=env)
+        print(f"Launched kiosk browser on the HDMI display -> {url}")
+    except FileNotFoundError:
+        print("chromium not found; skipping kiosk browser launch on HDMI display")
 
 if __name__ == "__main__":
     print("Warming up model (takes a few seconds)...")
@@ -608,10 +733,14 @@ if __name__ == "__main__":
 
     Thread(target=_auto_monitor, daemon=True).start()
     Thread(target=_led_blinker, daemon=True).start()
+    Thread(target=_launch_kiosk_browser, daemon=True).start()
+    button_cb = pi.callback(BUTTON_PIN, pigpio.FALLING_EDGE, _on_button_edge)
+    print("Manual-sort button ready on GPIO23 (physical pin 16)")
     print(f"\n LIVE! open this on your Mac browser: http://10.103.210.108:{PORT}\n")
     try:
         StreamingServer(("", PORT), Handler).serve_forever()
     finally:
+        button_cb.cancel()
         pi.write(LED_PIN, 0)  # make sure the warning LED is off on exit
         if tof_sensor is not None:
             tof_sensor.stop_ranging()
