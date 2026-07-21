@@ -371,8 +371,8 @@ def _act_on_result(label, is_recycle, is_ewaste):
         Thread(target=move_servo, args=(is_recycle,), daemon=True).start()
 
 # --- the web page ---
-PAGE = """<!doctype html>
-<html><head><meta charset="utf-8"><title>Trash vs Recycle</title>
+DEBUG_PAGE = """<!doctype html>
+<html><head><meta charset="utf-8"><title>Trash vs Recycle — DEBUG</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
 body{font-family:sans-serif;text-align:center;background:#111;color:#eee;margin:0;padding:16px}
@@ -407,7 +407,7 @@ button:active{background:#1b5e20}
 .col-status .ewaste{margin:14px 0 0}
 </style></head>
 <body>
-<h1>Trash vs Recycle</h1>
+<h1>Trash vs Recycle — DEBUG <a href="/" style="font-size:14px;color:#7aa">(open demo screen)</a></h1>
 <div class="layout">
 <div class="col-cam">
 <img src="/stream.mjpg">
@@ -538,6 +538,149 @@ setInterval(refreshStatus, 500);
 </script>
 </body></html>"""
 
+# --- the demo screen shown full-screen on the Pi's HDMI display ---
+# Deliberately minimal: live camera + one big verdict card + a full-screen
+# e-waste warning. No SORT / ARM / engine controls -- classification is driven
+# by the physical GPIO23 button (and the ToF auto-trigger when wired). Every
+# bit of state comes from polling /status, so this page carries no logic of its
+# own beyond rendering last_result_* and ewaste_alert.
+DEMO_PAGE = """<!doctype html>
+<html><head><meta charset="utf-8"><title>Smart Waste Sorter</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;overflow:hidden}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+background:radial-gradient(120% 120% at 50% -10%,#16263a 0%,#0b1622 45%,#05090f 100%);
+color:#e8eef5;display:flex;flex-direction:column;height:100vh;padding:2.2vmin}
+.topbar{display:flex;align-items:center;justify-content:space-between;padding:0 0.6vmin 1.6vmin}
+.brand{display:flex;align-items:center;gap:1.2vmin;font-weight:800;font-size:clamp(20px,3.2vmin,40px);letter-spacing:0.5px}
+.brand .logo{font-size:clamp(24px,3.8vmin,46px)}
+.brand small{display:block;font-weight:500;font-size:clamp(10px,1.4vmin,16px);color:#8aa0b6;letter-spacing:2px;text-transform:uppercase}
+.live{display:flex;align-items:center;gap:1vmin;font-size:clamp(12px,1.7vmin,20px);font-weight:700;color:#9fb3c7;letter-spacing:1.5px}
+.live .dot{width:1.4vmin;height:1.4vmin;min-width:9px;min-height:9px;border-radius:50%;background:#ef4444;box-shadow:0 0 0 0 rgba(239,68,68,.6);animation:pulse 1.6s infinite}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(239,68,68,.6)}70%{box-shadow:0 0 0 2.2vmin rgba(239,68,68,0)}100%{box-shadow:0 0 0 0 rgba(239,68,68,0)}}
+.grid{flex:1;display:flex;gap:2.4vmin;min-height:0}
+.camera{flex:1.35;min-width:0;position:relative;border-radius:2.2vmin;overflow:hidden;
+background:#000;border:0.35vmin solid #223345;box-shadow:0 1.4vmin 4vmin rgba(0,0,0,.55)}
+.camera img{width:100%;height:100%;object-fit:cover;display:block}
+.camera .tag{position:absolute;top:1.4vmin;left:1.4vmin;background:rgba(5,9,15,.62);
+backdrop-filter:blur(6px);padding:0.7vmin 1.6vmin;border-radius:999px;font-size:clamp(11px,1.5vmin,18px);font-weight:600;color:#cdd9e6}
+.card{flex:1;min-width:0;border-radius:2.2vmin;padding:3vmin;display:flex;flex-direction:column;
+justify-content:center;gap:1.8vmin;border:0.35vmin solid rgba(255,255,255,.06);
+background:linear-gradient(160deg,rgba(255,255,255,.05),rgba(255,255,255,.015));
+box-shadow:0 1.4vmin 4vmin rgba(0,0,0,.5);transition:background .35s,border-color .35s}
+.kicker{font-size:clamp(13px,2vmin,24px);font-weight:800;letter-spacing:3px;text-transform:uppercase;color:#8aa0b6}
+.verdict{font-size:clamp(34px,7.4vmin,96px);font-weight:900;line-height:1.02;letter-spacing:-1px}
+.item{font-size:clamp(20px,3.6vmin,46px);font-weight:700;color:#f2f6fb;text-transform:capitalize}
+.meter{height:2vmin;min-height:12px;border-radius:999px;background:rgba(255,255,255,.09);overflow:hidden;position:relative;display:none}
+.meter-fill{height:100%;width:0;border-radius:999px;transition:width .5s ease,background .35s}
+.meter-label{font-size:clamp(12px,1.7vmin,20px);font-weight:700;color:#aebccb;margin-top:-0.4vmin}
+.reason{font-size:clamp(15px,2.3vmin,30px);line-height:1.35;color:#d5e0ec;font-style:italic}
+.reason .by{display:block;font-style:normal;font-weight:700;font-size:clamp(11px,1.5vmin,18px);
+letter-spacing:1.5px;text-transform:uppercase;color:#7f93a8;margin-top:1vmin}
+/* verdict theming */
+.card.idle .kicker{color:#8aa0b6}.card.idle .verdict{color:#c3d0dd}
+.card.thinking{border-color:rgba(245,158,11,.4);background:linear-gradient(160deg,rgba(245,158,11,.14),rgba(245,158,11,.03))}
+.card.thinking .kicker,.card.thinking .verdict{color:#fbbf24}
+.card.recycle{border-color:rgba(34,197,94,.5);background:linear-gradient(160deg,rgba(34,197,94,.18),rgba(34,197,94,.03))}
+.card.recycle .kicker,.card.recycle .verdict{color:#4ade80}
+.card.recycle .meter-fill{background:#22c55e}
+.card.trash{border-color:rgba(239,68,68,.5);background:linear-gradient(160deg,rgba(239,68,68,.16),rgba(239,68,68,.03))}
+.card.trash .kicker,.card.trash .verdict{color:#f87171}
+.card.trash .meter-fill{background:#ef4444}
+.dots::after{content:'';animation:dots 1.4s steps(4,end) infinite}
+@keyframes dots{0%{content:''}25%{content:'.'}50%{content:'..'}75%{content:'...'}}
+/* full-screen e-waste takeover */
+.ewaste{position:fixed;inset:0;z-index:50;display:none;flex-direction:column;align-items:center;justify-content:center;
+text-align:center;padding:5vmin;background:#7f1010;color:#fff;animation:ewblink 0.7s steps(1,end) infinite}
+.ewaste.show{display:flex}
+@keyframes ewblink{50%{background:#3a0606}}
+.ewaste .ic{font-size:clamp(60px,16vmin,220px);line-height:1}
+.ewaste .t{font-size:clamp(34px,8vmin,120px);font-weight:900;letter-spacing:1px;margin-top:1vmin}
+.ewaste .s{font-size:clamp(22px,4.6vmin,64px);font-weight:800;color:#ffd7d7;letter-spacing:4px;margin-top:0.4vmin}
+.ewaste .it{font-size:clamp(18px,3.4vmin,44px);font-weight:700;margin-top:2.6vmin;text-transform:capitalize}
+.ewaste .n{font-size:clamp(14px,2.3vmin,28px);color:#ffe1e1;margin-top:1.4vmin;max-width:24em}
+@media (orientation:portrait){.grid{flex-direction:column}.camera{flex:1.1}}
+</style></head>
+<body>
+<div class="topbar">
+  <div class="brand"><span class="logo">♻️</span><div>Smart Waste Sorter<small>AI recycling assistant</small></div></div>
+  <div class="live"><span class="dot"></span>LIVE</div>
+</div>
+<div class="grid">
+  <div class="camera"><img src="/stream.mjpg" alt="live camera"><div class="tag">📷 Live camera</div></div>
+  <div class="card idle" id="card">
+    <div class="kicker" id="kicker">Ready</div>
+    <div class="verdict" id="verdict">Place an item &amp; press the button</div>
+    <div class="item" id="item"></div>
+    <div class="meter" id="meter"><div class="meter-fill" id="meterFill"></div></div>
+    <div class="meter-label" id="meterLabel"></div>
+    <div class="reason" id="reason"></div>
+  </div>
+</div>
+<div class="ewaste" id="ewaste">
+  <div class="ic">⛔</div>
+  <div class="t">E-WASTE DETECTED</div>
+  <div class="s">DO NOT RECYCLE</div>
+  <div class="it" id="ewItem"></div>
+  <div class="n">Remove it and take it to an e-waste / hazardous-waste drop-off. The warning light is blinking.</div>
+</div>
+<script>
+var card=document.getElementById('card');
+var kicker=document.getElementById('kicker');
+var verdict=document.getElementById('verdict');
+var itemEl=document.getElementById('item');
+var meter=document.getElementById('meter');
+var meterFill=document.getElementById('meterFill');
+var meterLabel=document.getElementById('meterLabel');
+var reason=document.getElementById('reason');
+var ewaste=document.getElementById('ewaste');
+var ewItem=document.getElementById('ewItem');
+function setCard(cls){card.className='card '+cls;}
+function refresh(){
+fetch('/status').then(x=>x.json()).then(d=>{
+  // e-waste warning takes over the whole screen
+  if(d.ewaste_alert){
+    ewaste.classList.add('show');
+    ewItem.textContent = d.ewaste_item ? (d.ewaste_item) : '';
+    return;
+  }
+  ewaste.classList.remove('show');
+  // mid-classification
+  if(d.sort_active){
+    setCard('thinking');
+    kicker.textContent='Analyzing';
+    verdict.innerHTML='Thinking<span class="dots"></span>';
+    itemEl.textContent='';meter.style.display='none';meterLabel.textContent='';reason.textContent='';
+    return;
+  }
+  // a result to show
+  if(d.last_result_label){
+    var rec=d.last_result_is_recycle;
+    setCard(rec?'recycle':'trash');
+    kicker.textContent = rec ? 'Recyclable' : 'Landfill';
+    verdict.textContent = rec ? '♻️ RECYCLE' : '🗑️ TRASH';
+    itemEl.textContent = d.last_result_label;
+    var pct=Math.round((d.last_result_score||0)*100);
+    meter.style.display='block';
+    meterFill.style.width=pct+'%';
+    meterLabel.textContent=pct+'% confident';
+    var by = d.last_result_engine==='gemini' ? 'Gemini · Philadelphia rules' : 'On-device model';
+    reason.innerHTML = (d.last_result_reason ? ('“'+d.last_result_reason+'”') : '') + '<span class="by">— '+by+'</span>';
+    return;
+  }
+  // idle
+  setCard('idle');
+  kicker.textContent='Ready';
+  verdict.textContent='Place an item & press the button';
+  itemEl.textContent='';meter.style.display='none';meterLabel.textContent='';reason.textContent='';
+}).catch(()=>{});
+}
+setInterval(refresh,500);refresh();
+</script>
+</body></html>"""
+
 class StreamingOutput(io.BufferedIOBase):
     def __init__(self):
         self.frame = None
@@ -555,8 +698,10 @@ output = StreamingOutput()
 
 class Handler(server.BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path == "/":
-            body = PAGE.encode("utf-8")
+        if self.path == "/" or self.path == "/debug":
+            # "/" is the polished demo screen shown on the Pi's HDMI display;
+            # "/debug" is the full control panel for a developer's laptop.
+            body = (DEBUG_PAGE if self.path == "/debug" else DEMO_PAGE).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", len(body))
