@@ -4,6 +4,7 @@ os.environ['GPIOZERO_PIN_FACTORY'] = 'pigpio'
 
 import io
 import json
+import socket
 import socketserver
 import subprocess
 from http import server
@@ -117,23 +118,43 @@ gemini_error = None
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
 
-def _load_active_location():
+def _load_config():
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as handle:
-            return str(json.load(handle).get("location") or DEFAULT_LOCATION)
+            data = json.load(handle)
+            return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
-        return DEFAULT_LOCATION
+        return {}
 
 
-def _save_active_location(loc):
+def _save_config():
     try:
         with open(CONFIG_PATH, "w", encoding="utf-8") as handle:
-            json.dump({"location": loc}, handle)
+            json.dump({"location": active_location, "paired": paired}, handle)
     except OSError as exc:
         print(f"Could not save config.json: {exc}")
 
 
-active_location = _load_active_location()
+def _lan_ip():
+    """Best-effort primary LAN IP, so the screen can tell the app where to connect."""
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(("8.8.8.8", 80))  # no packets sent; just picks the route's source IP
+        return probe.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        probe.close()
+
+
+_cfg = _load_config()
+# Recycling ruleset location, set from the app via GET/POST /config.
+active_location = str(_cfg.get("location") or DEFAULT_LOCATION)
+# Whether an app has paired with this trashcan. When False the screen shows a
+# "waiting to be paired" prompt instead of the sorting UI. Set via /pair, /unpair.
+paired = bool(_cfg.get("paired", False))
+# The address the user types into the app -- shown on the waiting screen.
+DEVICE_URL = f"http://{_lan_ip()}:{PORT}"
 
 
 def _set_engine(gemini_on):
@@ -611,6 +632,21 @@ border-left:13vmin solid transparent;border-right:13vmin solid transparent;borde
 .ewaste .s{font-size:clamp(22px,4.6vmin,64px);font-weight:800;color:#ffd7d7;letter-spacing:4px;margin-top:0.4vmin}
 .ewaste .it{font-size:clamp(18px,3.4vmin,44px);font-weight:700;margin-top:2.6vmin;text-transform:capitalize}
 .ewaste .n{font-size:clamp(14px,2.3vmin,28px);color:#ffe1e1;margin-top:1.4vmin;max-width:24em}
+/* shown until an app pairs with this trashcan */
+.waiting{position:fixed;inset:0;z-index:60;display:none;flex-direction:column;align-items:center;justify-content:center;
+text-align:center;padding:6vmin;background:radial-gradient(120% 120% at 50% -8%,#13291c 0%,#0a1610 45%,#040704 100%)}
+.waiting.show{display:flex}
+.wring{width:15vmin;height:15vmin;border-radius:50%;border:0.7vmin solid rgba(150,190,156,.28);
+position:relative;margin-bottom:4vmin;display:flex;align-items:center;justify-content:center}
+.wring::before{content:"";position:absolute;inset:-0.7vmin;border-radius:50%;border:0.7vmin solid transparent;border-top-color:#96be9c;animation:wspin 1.1s linear infinite}
+.wring .core{width:5vmin;height:5vmin;border-radius:50%;background:#96be9c;box-shadow:0 0 3vmin #96be9c;animation:wpulse 1.6s ease-in-out infinite}
+@keyframes wspin{to{transform:rotate(360deg)}}
+@keyframes wpulse{0%,100%{opacity:.5;transform:scale(.82)}50%{opacity:1;transform:scale(1)}}
+.wtitle{font-size:clamp(28px,6vmin,72px);font-weight:900;color:#fff;letter-spacing:-.5px}
+.wsub{font-size:clamp(15px,2.6vmin,30px);color:#cfe0d5;margin-top:1.6vmin;max-width:22em;line-height:1.45}
+.waddr{margin-top:3.4vmin;font-family:SFMono-Regular,Menlo,Consolas,monospace;font-size:clamp(16px,3.2vmin,40px);font-weight:700;
+color:#fff;background:rgba(150,190,156,.14);border:0.3vmin solid rgba(150,190,156,.6);border-radius:2vmin;padding:1.4vmin 3vmin}
+.wsmall{font-size:clamp(11px,1.7vmin,20px);color:#8aa593;margin-top:2.8vmin;letter-spacing:2px;text-transform:uppercase}
 @media (orientation:portrait){.grid{flex-direction:column}.camera{flex:1.1}}
 </style></head>
 <body>
@@ -635,6 +671,13 @@ border-left:13vmin solid transparent;border-right:13vmin solid transparent;borde
   <div class="it" id="ewItem"></div>
   <div class="n">Remove it and take it to an e-waste / hazardous-waste drop-off. The warning light is blinking.</div>
 </div>
+<div class="waiting" id="waiting">
+  <div class="wring"><div class="core"></div></div>
+  <div class="wtitle">Waiting to be paired</div>
+  <div class="wsub">Open the Syft app, tap &ldquo;Set up your Syft,&rdquo; and enter this address:</div>
+  <div class="waddr" id="waddr">&mdash;</div>
+  <div class="wsmall">SYFT trashcan</div>
+</div>
 <script>
 var card=document.getElementById('card');
 var kicker=document.getElementById('kicker');
@@ -645,9 +688,18 @@ var reason=document.getElementById('reason');
 var ewaste=document.getElementById('ewaste');
 var ewItem=document.getElementById('ewItem');
 var rulesLabel=document.getElementById('rulesLabel');
+var waiting=document.getElementById('waiting');
+var waddr=document.getElementById('waddr');
 function setCard(cls){card.className='card '+cls;}
 function refresh(){
 fetch('/status').then(x=>x.json()).then(d=>{
+  // not paired to an app yet -> show the "connect me" screen with this device's address
+  if(!d.paired){
+    waiting.classList.add('show');
+    if(d.device_url){ waddr.textContent = d.device_url; }
+    return;
+  }
+  waiting.classList.remove('show');
   // top-right badge names the ruleset in effect right now, set from the app's /config
   rulesLabel.textContent = (d.location_label || 'Philadelphia') + ' rules';
   // e-waste warning takes over the whole screen
@@ -802,6 +854,8 @@ class Handler(server.BaseHTTPRequestHandler):
                 "gemini_error": gemini_error,
                 "location": active_location,
                 "location_label": active_location.split(",")[0].strip(),
+                "paired": paired,
+                "device_url": DEVICE_URL,
                 "ewaste_alert": ewaste_alert,
                 "ewaste_item": ewaste_item,
                 "sort_active": sort_active,
@@ -819,7 +873,12 @@ class Handler(server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
         elif self.path == "/config":
-            body = json.dumps({"location": active_location, "available": LOCATIONS}).encode()
+            body = json.dumps({
+                "location": active_location,
+                "available": LOCATIONS,
+                "paired": paired,
+                "device_url": DEVICE_URL,
+            }).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", len(body))
@@ -842,10 +901,21 @@ class Handler(server.BaseHTTPRequestHandler):
                 self.send_response(400)
             else:
                 active_location = new_loc
-                _save_active_location(active_location)
+                _save_config()
                 print(f"Recycling location set to: {active_location}")
                 body = json.dumps({"ok": True, "location": active_location}).encode()
                 self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", len(body))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path in ("/pair", "/unpair"):
+            global paired
+            paired = self.path == "/pair"
+            _save_config()
+            print(f"Trashcan {'paired with app' if paired else 'unpaired -- waiting screen'}")
+            body = json.dumps({"ok": True, "paired": paired}).encode()
+            self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", len(body))
             self.end_headers()
