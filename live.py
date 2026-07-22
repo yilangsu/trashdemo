@@ -9,7 +9,7 @@ import socketserver
 import subprocess
 from http import server
 from threading import Condition, Lock, Thread
-from time import monotonic, sleep
+from time import monotonic, sleep, time
 from urllib.parse import parse_qs, urlparse
 from PIL import Image
 from picamera2 import Picamera2
@@ -93,6 +93,78 @@ last_result_is_recycle = None
 last_result_reason = None
 last_result_engine = None
 last_result_is_ewaste = None
+# Weight (grams) of the last item, from Gemini's estimate (or a heuristic on the
+# on-device fallback). Set in _run_classifier just before _record_result runs.
+last_result_weight_g = None
+
+# --- Sorting history + running stats, so the app can show real activity ---
+# Every sorted item is appended to history.jsonl and folded into stats_totals.
+# recent_history keeps the last few for the app's "Recently Sorted" feed.
+HISTORY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "history.jsonl")
+HISTORY_FEED_MAX = 50
+history_lock = Lock()
+recent_history = []
+stats_totals = {"total": 0, "recycle": 0, "trash": 0, "ewaste": 0,
+                "weight_g": 0.0, "recycled_weight_g": 0.0}
+
+# Rough fallback weights (grams) by material keyword, only for the on-device
+# model (Gemini estimates its own). Order matters -- first keyword hit wins.
+_FALLBACK_WEIGHTS_G = [
+    ("glass", 200), ("bottle", 30), ("can", 15), ("metal", 20), ("cardboard", 40),
+    ("paper", 10), ("plastic", 25), ("battery", 25), ("carton", 30),
+]
+
+
+def _estimate_weight_g(label):
+    low = (label or "").lower()
+    for key, grams in _FALLBACK_WEIGHTS_G:
+        if key in low:
+            return float(grams)
+    return 20.0
+
+
+def _fold_into_stats(rec):
+    stats_totals["total"] += 1
+    if rec.get("is_ewaste"):
+        stats_totals["ewaste"] += 1
+    elif rec.get("is_recycle"):
+        stats_totals["recycle"] += 1
+    else:
+        stats_totals["trash"] += 1
+    grams = float(rec.get("weight_g") or 0.0)
+    stats_totals["weight_g"] += grams
+    if rec.get("is_recycle") and not rec.get("is_ewaste"):
+        stats_totals["recycled_weight_g"] += grams
+
+
+def _load_history():
+    try:
+        with open(HISTORY_PATH, "r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                _fold_into_stats(rec)
+                recent_history.append(rec)
+    except OSError:
+        pass
+    del recent_history[:-HISTORY_FEED_MAX]  # keep only the most recent for the feed
+
+
+def _log_sorted_item(record):
+    with history_lock:
+        _fold_into_stats(record)
+        recent_history.append(record)
+        del recent_history[:-HISTORY_FEED_MAX]
+        try:
+            with open(HISTORY_PATH, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record) + "\n")
+        except OSError as exc:
+            print(f"Could not append to history.jsonl: {exc}")
 
 
 def _record_result(source, label, score, is_recycle, reason, engine, is_ewaste):
@@ -105,6 +177,18 @@ def _record_result(source, label, score, is_recycle, reason, engine, is_ewaste):
     last_result_reason = reason
     last_result_engine = engine
     last_result_is_ewaste = is_ewaste
+    _log_sorted_item({
+        "ts": time(),
+        "item": label,
+        "score": score,
+        "is_recycle": bool(is_recycle),
+        "is_ewaste": bool(is_ewaste),
+        "bucket": "ewaste" if is_ewaste else ("recycle" if is_recycle else "trash"),
+        "reason": reason,
+        "engine": engine,
+        "source": source,
+        "weight_g": last_result_weight_g,
+    })
 
 # Which classifier the SORT button / auto-trigger uses.
 # Always Gemini 3 + Philadelphia rules. On-device WasteNet stays available only as
@@ -168,11 +252,12 @@ def _run_classifier(image):
     (label, score, is_recycle, reason, engine, is_ewaste).
     If Gemini is on but fails, fall back to the on-device model so a demo never
     hard-stops."""
-    global gemini_error
+    global gemini_error, last_result_weight_g
     if use_gemini:
         try:
-            label, score, is_recycle, reason, is_ewaste = classify_pil_gemini(image, active_location)
+            label, score, is_recycle, reason, is_ewaste, weight_g = classify_pil_gemini(image, active_location)
             gemini_error = None
+            last_result_weight_g = weight_g
             return label, score, is_recycle, reason, "gemini", is_ewaste
         except Exception as exc:  # network down, missing key/package, etc.
             gemini_error = str(exc)
@@ -182,6 +267,7 @@ def _run_classifier(image):
     is_ewaste = label in EWASTE
     if is_ewaste:
         is_recycle = False
+    last_result_weight_g = _estimate_weight_g(label)
     return label, score, is_recycle, "", "local", is_ewaste
 
 
@@ -884,6 +970,40 @@ class Handler(server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", len(body))
             self.end_headers()
             self.wfile.write(body)
+        elif self.path.startswith("/history"):
+            params = parse_qs(urlparse(self.path).query)
+            try:
+                limit = int(params.get("limit", ["20"])[0])
+            except ValueError:
+                limit = 20
+            limit = max(1, min(limit, HISTORY_FEED_MAX))
+            with history_lock:
+                items = list(reversed(recent_history[-limit:]))  # most recent first
+            body = json.dumps({"items": items}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", len(body))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/stats":
+            with history_lock:
+                total_g = stats_totals["weight_g"]
+                recycled_g = stats_totals["recycled_weight_g"]
+                body = json.dumps({
+                    "total_items": stats_totals["total"],
+                    "recycled_items": stats_totals["recycle"],
+                    "trash_items": stats_totals["trash"],
+                    "ewaste_items": stats_totals["ewaste"],
+                    "total_weight_g": round(total_g, 1),
+                    "recycled_weight_g": round(recycled_g, 1),
+                    "total_weight_lbs": round(total_g / 453.592, 2),
+                    "recycled_weight_lbs": round(recycled_g / 453.592, 2),
+                }).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", len(body))
+            self.end_headers()
+            self.wfile.write(body)
         else:
             self.send_error(404)
 
@@ -969,6 +1089,8 @@ def _launch_kiosk_browser():
 if __name__ == "__main__":
     print("Warming up model (takes a few seconds)...")
     classify_pil(Image.new("RGB", (224, 224)))
+    _load_history()
+    print(f"Loaded {stats_totals['total']} past sorted items from history.jsonl")
 
     if board is not None and busio is not None and adafruit_vl53l1x is not None:
         try:

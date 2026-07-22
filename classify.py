@@ -500,6 +500,7 @@ def classify_pil_gemini(image, location=DEFAULT_LOCATION):
         is_ewaste: bool
         reason: str
         confidence: float
+        weight_g: float  # realistic estimate of the object's weight in grams
 
     buffer = io.BytesIO()
     image.convert("RGB").save(buffer, format="JPEG", quality=85)
@@ -509,7 +510,8 @@ def classify_pil_gemini(image, location=DEFAULT_LOCATION):
         model=GEMINI_MODEL,
         contents=[
             types.Part.from_bytes(data=buffer.getvalue(), mime_type="image/jpeg"),
-            f"Recycle or trash under {location} curbside rules? Explain briefly.",
+            f"Recycle or trash under {location} curbside rules? Also estimate the item's "
+            f"weight in grams (weight_g) from what you see. Explain briefly.",
         ],
         config=types.GenerateContentConfig(
             system_instruction=system_prompt_for(location),
@@ -522,7 +524,8 @@ def classify_pil_gemini(image, location=DEFAULT_LOCATION):
     # e-waste is never recyclable -- enforce it here so a stray true can't leak
     # a battery into the recycling stream.
     is_recycle = bool(verdict.is_recycle) and not is_ewaste
-    return verdict.item, float(verdict.confidence), is_recycle, verdict.reason, is_ewaste
+    weight_g = max(0.0, float(verdict.weight_g))
+    return verdict.item, float(verdict.confidence), is_recycle, verdict.reason, is_ewaste, weight_g
 
 
 if __name__ == "__main__":

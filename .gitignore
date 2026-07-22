@@ -7,6 +7,9 @@ __pycache__/
 # per-device runtime config (recycling location, set from the app) — device-local
 config.json
 
+# per-device sorting history / stats — device-local
+history.jsonl
+
 # large model weights (exceed GitHub's 100MB file limit)
 model/pytorch_model.bin
 model/model.onnx.data
