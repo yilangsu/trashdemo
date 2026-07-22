@@ -15,7 +15,7 @@ from picamera2 import Picamera2
 from picamera2.encoders import MJPEGEncoder
 from picamera2.outputs import FileOutput
 import pigpio
-from classify import classify_pil, classify_pil_gemini, EWASTE
+from classify import classify_pil, classify_pil_gemini, EWASTE, LOCATIONS, DEFAULT_LOCATION
 
 try:
     import board
@@ -112,6 +112,29 @@ def _record_result(source, label, score, is_recycle, reason, engine, is_ewaste):
 use_gemini = True
 gemini_error = None
 
+# Recycling ruleset location, set from the phone app via GET/POST /config and
+# persisted to config.json next to this file so it survives restarts.
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+
+
+def _load_active_location():
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as handle:
+            return str(json.load(handle).get("location") or DEFAULT_LOCATION)
+    except (OSError, ValueError):
+        return DEFAULT_LOCATION
+
+
+def _save_active_location(loc):
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as handle:
+            json.dump({"location": loc}, handle)
+    except OSError as exc:
+        print(f"Could not save config.json: {exc}")
+
+
+active_location = _load_active_location()
+
 
 def _set_engine(gemini_on):
     global use_gemini
@@ -127,7 +150,7 @@ def _run_classifier(image):
     global gemini_error
     if use_gemini:
         try:
-            label, score, is_recycle, reason, is_ewaste = classify_pil_gemini(image)
+            label, score, is_recycle, reason, is_ewaste = classify_pil_gemini(image, active_location)
             gemini_error = None
             return label, score, is_recycle, reason, "gemini", is_ewaste
         except Exception as exc:  # network down, missing key/package, etc.
@@ -625,8 +648,8 @@ var rulesLabel=document.getElementById('rulesLabel');
 function setCard(cls){card.className='card '+cls;}
 function refresh(){
 fetch('/status').then(x=>x.json()).then(d=>{
-  // top-right badge names the ruleset in effect right now (falls back if Gemini errors)
-  rulesLabel.textContent = (d.last_result_engine==='local') ? 'Standard rules' : 'Philadelphia rules';
+  // top-right badge names the ruleset in effect right now, set from the app's /config
+  rulesLabel.textContent = (d.location_label || 'Philadelphia') + ' rules';
   // e-waste warning takes over the whole screen
   if(d.ewaste_alert){
     ewaste.classList.add('show');
@@ -777,6 +800,8 @@ class Handler(server.BaseHTTPRequestHandler):
                 "absent_streak": absent_streak,
                 "engine": "gemini" if use_gemini else "local",
                 "gemini_error": gemini_error,
+                "location": active_location,
+                "location_label": active_location.split(",")[0].strip(),
                 "ewaste_alert": ewaste_alert,
                 "ewaste_item": ewaste_item,
                 "sort_active": sort_active,
@@ -793,8 +818,52 @@ class Handler(server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", len(data))
             self.end_headers()
             self.wfile.write(data)
+        elif self.path == "/config":
+            body = json.dumps({"location": active_location, "available": LOCATIONS}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", len(body))
+            self.end_headers()
+            self.wfile.write(body)
         else:
             self.send_error(404)
+
+    def do_POST(self):
+        if self.path == "/config":
+            global active_location
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length) if length else b"{}"
+            try:
+                new_loc = str(json.loads(raw or b"{}").get("location", "")).strip()
+            except ValueError:
+                new_loc = ""
+            if not new_loc:
+                body = json.dumps({"error": "missing 'location'"}).encode()
+                self.send_response(400)
+            else:
+                active_location = new_loc
+                _save_active_location(active_location)
+                print(f"Recycling location set to: {active_location}")
+                body = json.dumps({"ok": True, "location": active_location}).encode()
+                self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", len(body))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_error(404)
+
+    def do_OPTIONS(self):
+        # CORS preflight for the app's POST /config (browsers send this first).
+        self.send_response(204)
+        self.end_headers()
+
+    def end_headers(self):
+        # Let the Expo app -- native AND web preview -- call these cross-origin.
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        super().end_headers()
 
     def log_message(self, *args):
         pass  # quiet

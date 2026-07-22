@@ -427,6 +427,56 @@ looks empty/clean enough not to contaminate the batch.
 Keep the reason short (max ~15 words), plain enough to read off a screen, and cite \
 the Philly rule (e.g. "Empty #1 plastic bottle -- Philly takes #1/#2/#5")."""
 
+
+# The app offers this fixed list of vetted locations. Philadelphia is a curated,
+# hand-written rule set (above); anything else uses the generic prompt below,
+# which asks Gemini to apply that municipality's own official rules. Add more
+# vetted cities here (and optionally a curated profile in _LOCATION_PROFILES).
+LOCATIONS = ["Philadelphia, PA"]
+DEFAULT_LOCATION = "Philadelphia, PA"
+
+_LOCATION_PROFILES = {
+    "Philadelphia, PA": PHILLY_SYSTEM_PROMPT,
+}
+
+
+def _generic_system_prompt(location):
+    """Rules prompt for any location we don't have a curated profile for."""
+    return f"""You are the sorting brain for an automated trash/recycling bin located in \
+{location}. Follow that municipality's OWN official curbside single-stream recycling rules \
+EXACTLY -- not generic or national guidance. If {location} has no distinct program, use the \
+rules for the nearest governing municipality.
+
+You are shown ONE photo of ONE object being dropped into the bin. Decide whether it belongs \
+in RECYCLE or TRASH under {location}'s rules, then answer.
+
+DECISION RULES:
+- Call it RECYCLE only if it clearly matches a locally accepted category AND looks empty/clean \
+enough not to contaminate the batch.
+- Contaminated recyclables (food residue, liquid still inside, grease) are TRASH.
+- Plastic bags, plastic film/wrap, and foam/polystyrene are TRASH in almost every curbside \
+program unless {location} explicitly accepts them.
+- When genuinely unsure, choose TRASH -- one dirty item can spoil a whole batch ("when in \
+doubt, throw it out"). If you cannot identify the object, choose TRASH with low confidence.
+
+E-WASTE -- SPECIAL HANDLING (set is_ewaste=true):
+- Batteries of ANY kind (AA/AAA/9V, button/coin cells, lithium, car, power banks), phones, \
+tablets, laptops, chargers, power adapters, power cords, cables, headphones/earbuds, light \
+bulbs, and any small electronic device or ANYTHING that contains a battery, plug, or circuit \
+board.
+- E-waste is NEVER curbside-recyclable and is NOT regular trash. If the object is e-waste, set \
+is_ewaste=true AND is_recycle=false. It must go to a hazardous-waste / e-waste drop-off. Say so \
+briefly in the reason.
+
+Keep the reason short (max ~15 words), plain enough to read off a screen, and cite the local \
+rule where you can."""
+
+
+def system_prompt_for(location):
+    """Curated profile if we have one for this location, else the generic prompt."""
+    return _LOCATION_PROFILES.get(location) or _generic_system_prompt(location)
+
+
 _gemini_client = None
 
 
@@ -438,8 +488,8 @@ def _get_gemini_client():
     return _gemini_client
 
 
-def classify_pil_gemini(image):
-    """Classify a PIL image with Gemini under Philadelphia rules.
+def classify_pil_gemini(image, location=DEFAULT_LOCATION):
+    """Classify a PIL image with Gemini under the given location's curbside rules.
     Returns (label, score, is_recycle, reason, is_ewaste)."""
     from google.genai import types
     from pydantic import BaseModel
@@ -459,10 +509,10 @@ def classify_pil_gemini(image):
         model=GEMINI_MODEL,
         contents=[
             types.Part.from_bytes(data=buffer.getvalue(), mime_type="image/jpeg"),
-            "Recycle or trash under Philadelphia curbside rules? Explain briefly.",
+            f"Recycle or trash under {location} curbside rules? Explain briefly.",
         ],
         config=types.GenerateContentConfig(
-            system_instruction=PHILLY_SYSTEM_PROMPT,
+            system_instruction=system_prompt_for(location),
             response_mime_type="application/json",
             response_schema=Verdict,
         ),
