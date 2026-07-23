@@ -519,14 +519,34 @@ def _clear_ewaste_alert():
     ewaste_item = None
 
 
+# Substrings that mean the classifier couldn't tell what the object is. When the
+# label matches, we leave the servo at home instead of guessing a bin.
+_UNIDENTIFIED_MARKERS = ("unidentif", "unknown", "can't identif", "cannot identif",
+                         "not identif", "no object", "no item")
+
+
+def _is_unidentified(label):
+    low = (label or "").strip().lower()
+    if not low:
+        return True
+    return any(marker in low for marker in _UNIDENTIFIED_MARKERS)
+
+
 def _act_on_result(label, is_recycle, is_ewaste):
     """Decide what the hardware does with a classification: blink-and-hold for
-    e-waste, otherwise clear any prior alert and drive the sorting servo."""
+    e-waste, otherwise clear any prior alert and drive the sorting servo. An
+    unidentified object gets no servo movement -- the tray holds still so we
+    don't dump an unknown item into the wrong bin."""
     if is_ewaste:
         _raise_ewaste_alert(label)
-    else:
-        _clear_ewaste_alert()
-        Thread(target=move_servo, args=(is_recycle,), daemon=True).start()
+        return
+    _clear_ewaste_alert()
+    if _is_unidentified(label):
+        global status_text
+        status_text = f"Unidentified object -- not sorting ({label})"
+        print(f"Unidentified object, servo held at home: {label}")
+        return
+    Thread(target=move_servo, args=(is_recycle,), daemon=True).start()
 
 # --- the web page ---
 DEBUG_PAGE = """<!doctype html>

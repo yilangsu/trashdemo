@@ -422,7 +422,9 @@ looks empty/clean enough not to contaminate the batch.
 - Contaminated recyclables (food residue, liquid still inside, grease) are TRASH.
 - When genuinely unsure, choose TRASH -- one dirty item can spoil a whole batch \
 ("when in doubt, throw it out").
-- If you cannot identify the object, choose TRASH with low confidence.
+- If you genuinely cannot tell what the object is, set item to exactly \
+"Unidentified object", with is_recycle=false, is_ewaste=false, and low confidence. \
+Do NOT guess a category -- the bin will hold still and not sort it.
 
 Keep the reason short (max ~15 words), plain enough to read off a screen, and cite \
 the Philly rule (e.g. "Empty #1 plastic bottle -- Philly takes #1/#2/#5")."""
@@ -457,7 +459,9 @@ enough not to contaminate the batch.
 - Plastic bags, plastic film/wrap, and foam/polystyrene are TRASH in almost every curbside \
 program unless {location} explicitly accepts them.
 - When genuinely unsure, choose TRASH -- one dirty item can spoil a whole batch ("when in \
-doubt, throw it out"). If you cannot identify the object, choose TRASH with low confidence.
+doubt, throw it out"). If you genuinely cannot tell what the object is, set item to exactly \
+"Unidentified object", with is_recycle=false, is_ewaste=false, and low confidence -- do NOT \
+guess a category, the bin will hold still and not sort it.
 
 E-WASTE -- SPECIAL HANDLING (set is_ewaste=true):
 - Batteries of ANY kind (AA/AAA/9V, button/coin cells, lithium, car, power banks), phones, \
