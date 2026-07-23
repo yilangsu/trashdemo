@@ -38,11 +38,15 @@ LED_BLINK_INTERVAL = 0.25  # seconds on / off while the e-waste alert is active
 # pull-up keeps the pin high until pressed, so a press reads as a falling edge.
 # GPIO23 = physical pin 16.
 BUTTON_PIN = 23
-BUTTON_DEBOUNCE_US = 250000  # 250ms glitch filter to ignore switch bounce
+BUTTON_DEBOUNCE_US = 10000  # 10ms glitch filter to ignore switch bounce
 PORT = 8000
 HOME_US = 1500
 RECYCLE_US = 2200
 TRASH_US = 800
+# How long the tray keeps physically wobbling after the servo returns home.
+# The sensor monitor stays paused for this long past the servo's return so the
+# settling tray isn't misread as a new item.
+SERVO_SETTLE_SECONDS = 1.0
 AUTO_TRIGGER = True
 PRESENT_THRESHOLD_PCT = 20.0
 ABSENT_THRESHOLD_PCT = 8.0
@@ -75,8 +79,13 @@ sensor_distance_mm = None
 sensor_delta_mm = None
 sensor_delta_pct = None
 sort_active = False
+# True while the servo is physically travelling (and settling). The auto monitor
+# ignores sensor readings during this window so the moving tray isn't mistaken
+# for a new item -- otherwise every sort would re-trigger itself.
+servo_active = False
 baseline_distance_mm = None
 tof_sensor = None
+last_button_press_time = 0.0
 
 # e-waste rejection: when the classifier spots a battery/electronics we refuse
 # to sort it (servo stays home) and blink the warning LED until it's cleared.
@@ -362,8 +371,14 @@ def _sort_frame(frame, source):
 
 
 def _button_sort_trigger():
-    if classify_lock.locked() or sort_active:
-        return  # already mid-sort, ignore this press
+    global last_button_press_time
+    now = monotonic()
+    if now - last_button_press_time < 0.5:
+        return  # ignore rapid double-presses within 500ms
+    last_button_press_time = now
+
+    if classify_lock.locked() or sort_active or servo_active:
+        return  # already mid-sort or servo still moving, ignore this press
     with output.condition:
         if output.frame is None:
             output.condition.wait(timeout=1.0)
@@ -395,7 +410,7 @@ def _auto_monitor():
 
     print("Auto-trigger monitor running")
     while True:
-        if classify_lock.locked() or sort_active:
+        if classify_lock.locked() or sort_active or servo_active:
             sleep(SENSOR_POLL_SECONDS)
             continue
 
@@ -450,11 +465,20 @@ def _auto_monitor():
         sleep(SENSOR_POLL_SECONDS)
 
 def move_servo(is_recycle):
-    """Move to recycle/trash PWM, then return to center."""
-    pulsewidth = RECYCLE_US if is_recycle else TRASH_US
-    pi.set_servo_pulsewidth(SERVO_PIN, pulsewidth)
-    sleep(2.0)
-    pi.set_servo_pulsewidth(SERVO_PIN, HOME_US)
+    """Move to recycle/trash PWM, then return to center. Holds ``servo_active``
+    for the whole travel plus a settle window so the auto monitor ignores the
+    moving/settling tray instead of re-triggering on it."""
+    global servo_active
+    servo_active = True
+    try:
+        pulsewidth = RECYCLE_US if is_recycle else TRASH_US
+        pi.set_servo_pulsewidth(SERVO_PIN, pulsewidth)
+        sleep(2.0)
+        pi.set_servo_pulsewidth(SERVO_PIN, HOME_US)
+        sleep(2.0)  # let it travel back before we call the tray "settling"
+        sleep(SERVO_SETTLE_SECONDS)
+    finally:
+        servo_active = False
 
 
 def _led_blinker():
