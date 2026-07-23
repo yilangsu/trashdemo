@@ -48,6 +48,12 @@ TRASH_US = 800
 # settling tray isn't misread as a new item.
 SERVO_SETTLE_SECONDS = 1.0
 AUTO_TRIGGER = True
+# Absolute-distance trigger: an item counts as "present" when the ToF sensor
+# reads a distance inside this window (mm). This replaces the old baseline/
+# percentage logic -- the object is detected purely by how close it is, so a
+# bad/empty baseline can no longer stop it from firing.
+TRIGGER_MIN_MM = 2.0
+TRIGGER_MAX_MM = 10.0
 PRESENT_THRESHOLD_PCT = 20.0
 ABSENT_THRESHOLD_PCT = 8.0
 PRESENT_CONFIRMATIONS = 2
@@ -415,33 +421,29 @@ def _auto_monitor():
             continue
 
         distance_mm = _read_sensor_distance_mm()
-        if distance_mm is None or baseline_distance_mm is None:
-            if baseline_distance_mm is None:
-                sensor_state = "waiting_for_baseline"
-            else:
-                sensor_state = "waiting_for_reading"
+        if distance_mm is None:
+            sensor_state = "waiting_for_reading"
             sleep(SENSOR_POLL_SECONDS)
             continue
 
         sensor_distance_mm = float(distance_mm)
-        delta_mm = baseline_distance_mm - float(distance_mm)
-        delta_pct = (delta_mm / baseline_distance_mm * 100.0) if baseline_distance_mm > 0 else 0.0
-        sensor_delta_mm = delta_mm
-        sensor_delta_pct = delta_pct
-        if auto_armed and delta_pct >= PRESENT_THRESHOLD_PCT:
+        # Baseline delta is kept only for the on-screen readout now -- the
+        # trigger below uses the absolute distance window instead.
+        if baseline_distance_mm:
+            sensor_delta_mm = baseline_distance_mm - float(distance_mm)
+            sensor_delta_pct = sensor_delta_mm / baseline_distance_mm * 100.0
+
+        present = TRIGGER_MIN_MM <= distance_mm <= TRIGGER_MAX_MM
+        if present:
             sensor_state = "present"
             present_streak += 1
             absent_streak = 0
-            status_text = f"AUTO detecting: {delta_pct:.0f}% change ({delta_mm:.1f} mm)"
-        elif delta_pct <= ABSENT_THRESHOLD_PCT:
+            status_text = f"AUTO detecting: {distance_mm:.1f} mm"
+        else:
             sensor_state = "absent"
             absent_streak += 1
             present_streak = 0
             status_text = f"AUTO waiting: {distance_mm:.1f} mm"
-        else:
-            sensor_state = "uncertain"
-            present_streak = 0
-            absent_streak = 0
 
         if auto_armed and present_streak >= PRESENT_CONFIRMATIONS:
             auto_armed = False
