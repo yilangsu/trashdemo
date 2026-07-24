@@ -77,6 +77,11 @@ pi.set_glitch_filter(BUTTON_PIN, BUTTON_DEBOUNCE_US)
 
 classify_lock = Lock()
 auto_armed = True
+# Master switch for the ToF auto-trigger. When False the sensor still reads and
+# the debug readout still updates, but nothing sorts automatically -- you drive
+# it by hand with the page SORT button (or the physical GPIO button). Toggled
+# from the debug page via /auto?on=0|1.
+auto_enabled = True
 present_streak = 0
 absent_streak = 0
 status_text = "AUTO not armed"
@@ -407,6 +412,7 @@ def _on_button_edge(gpio, level, tick):
 def _auto_monitor():
     global auto_armed, present_streak, absent_streak, baseline_distance_mm, status_text
     global sensor_state, sensor_distance_mm, sensor_delta_mm, sensor_delta_pct
+    global auto_enabled
     if not AUTO_TRIGGER:
         return
     if tof_sensor is None:
@@ -444,6 +450,14 @@ def _auto_monitor():
             absent_streak += 1
             present_streak = 0
             status_text = f"AUTO waiting: {distance_mm:.1f} mm"
+
+        if not auto_enabled:
+            # Auto-trigger switched off: keep reporting sensor readings but never
+            # fire -- sorting is manual only (page/GPIO button).
+            sensor_state = "auto_off"
+            status_text = f"AUTO off (manual only): {distance_mm:.1f} mm"
+            sleep(SENSOR_POLL_SECONDS)
+            continue
 
         if auto_armed and present_streak >= PRESENT_CONFIRMATIONS:
             auto_armed = False
@@ -571,6 +585,7 @@ button:active{background:#1b5e20}
 <img src="/stream.mjpg">
 <div><button onclick="sort()">SORT</button></div>
 <div><button onclick="armAuto()">ARM AUTO</button></div>
+<div><label class="switch"><input type="checkbox" id="autoToggle" checked onchange="toggleAuto()"> Auto-trigger enabled</label></div>
 </div>
 <div class="col-status">
 <div id="result">Hold an object in view, then hit SORT</div>
@@ -585,6 +600,7 @@ button:active{background:#1b5e20}
 <div id="engineNote" class="enginenote gemini">☁️ ACTIVE: Gemini 3 + Philadelphia rules (auto-falls back to on-device if it errors)</div>
 </div>
 <div class="sensor">
+    <div><strong>Auto-trigger:</strong> <span id="autoEnabledValue">on</span></div>
     <div><strong>State:</strong> <span id="sensorState">idle</span></div>
     <div><strong>Baseline:</strong> <span id="baselineValue">-</span></div>
     <div><strong>Distance:</strong> <span id="distanceValue">-</span></div>
@@ -645,6 +661,14 @@ var s=document.getElementById('status');
 s.textContent='arming from current empty view...';
 fetch('/arm').then(x=>x.json()).then(d=>{s.textContent=d.status;}).catch(e=>{s.textContent='error: '+e;});
 }
+var autoToggleDirty=0;
+function toggleAuto(){
+var on=document.getElementById('autoToggle').checked;
+autoToggleDirty=1;  // ignore /status echoes briefly so the switch doesn't flap
+fetch('/auto?on='+(on?1:0)).then(x=>x.json()).then(d=>{
+document.getElementById('autoEnabledValue').textContent=d.auto_enabled?'on':'OFF (manual only)';
+}).catch(e=>{}).then(()=>{setTimeout(function(){autoToggleDirty=0;},800);});
+}
 function refreshStatus(){
 fetch('/status').then(x=>x.json()).then(d=>{
 document.getElementById('status').textContent=d.status;
@@ -655,6 +679,10 @@ document.getElementById('distanceValue').textContent=d.sensor_distance_mm == nul
 document.getElementById('deltaValue').textContent=d.sensor_delta_mm == null ? '-' : d.sensor_delta_mm.toFixed(1) + ' mm';
 document.getElementById('deltaPctValue').textContent=d.sensor_delta_pct == null ? '-' : d.sensor_delta_pct.toFixed(0) + '%';
 document.getElementById('armedValue').textContent=d.auto_armed ? 'yes' : 'no';
+if(!autoToggleDirty && d.auto_enabled != null){
+document.getElementById('autoToggle').checked = d.auto_enabled;
+document.getElementById('autoEnabledValue').textContent = d.auto_enabled ? 'on' : 'OFF (manual only)';
+}
 document.getElementById('presentValue').textContent=d.present_streak;
 document.getElementById('absentValue').textContent=d.absent_streak;
 showEwaste(d.ewaste_alert, d.ewaste_item);
@@ -868,6 +896,7 @@ output = StreamingOutput()
 
 class Handler(server.BaseHTTPRequestHandler):
     def do_GET(self):
+        global sort_active, status_text, auto_enabled
         if self.path == "/" or self.path == "/debug":
             # "/" is the polished demo screen shown on the Pi's HDMI display;
             # "/debug" is the full control panel for a developer's laptop.
@@ -897,31 +926,49 @@ class Handler(server.BaseHTTPRequestHandler):
             except Exception:
                 pass  # browser disconnected
         elif self.path == "/sort":
-            with output.condition:
-                if output.frame is None:
-                    output.condition.wait(timeout=1.0)
-                frame = output.frame
-            if frame is None:
-                image = picam2.capture_image("main")
-                with classify_lock:
-                    label, score, is_recycle, reason, engine, is_ewaste = _run_classifier(image)
-                _record_result("MANUAL", label, score, is_recycle, reason, engine, is_ewaste)
-            else:
-                label, score, is_recycle, reason, engine, is_ewaste = _classify_frame(frame, "MANUAL")
-            data = json.dumps({
-                "label": label,
-                "score": score,
-                "is_recycle": is_recycle,
-                "is_ewaste": is_ewaste,
-                "reason": reason,
-                "engine": engine,
-            }).encode()
+            # Flag the sort as in-flight so every screen polling /status (the
+            # demo page especially) shows its "Thinking..." card while the
+            # classifier runs -- not just the debug page that fired the fetch.
+            sort_active = True
+            status_text = "MANUAL sorting..."
+            try:
+                with output.condition:
+                    if output.frame is None:
+                        output.condition.wait(timeout=1.0)
+                    frame = output.frame
+                if frame is None:
+                    image = picam2.capture_image("main")
+                    with classify_lock:
+                        label, score, is_recycle, reason, engine, is_ewaste = _run_classifier(image)
+                    _record_result("MANUAL", label, score, is_recycle, reason, engine, is_ewaste)
+                else:
+                    label, score, is_recycle, reason, engine, is_ewaste = _classify_frame(frame, "MANUAL")
+                data = json.dumps({
+                    "label": label,
+                    "score": score,
+                    "is_recycle": is_recycle,
+                    "is_ewaste": is_ewaste,
+                    "reason": reason,
+                    "engine": engine,
+                }).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", len(data))
+                self.end_headers()
+                self.wfile.write(data)
+                _act_on_result(label, is_recycle, is_ewaste)
+            finally:
+                sort_active = False
+        elif self.path.startswith("/auto"):
+            # Master on/off for the ToF auto-trigger. /auto?on=0 -> manual only.
+            params = parse_qs(urlparse(self.path).query)
+            auto_enabled = params.get("on", ["1"])[0] not in ("0", "false", "off", "no")
+            data = json.dumps({"auto_enabled": auto_enabled}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", len(data))
             self.end_headers()
             self.wfile.write(data)
-            _act_on_result(label, is_recycle, is_ewaste)
         elif self.path.startswith("/engine"):
             params = parse_qs(urlparse(self.path).query)
             engine = _set_engine(params.get("use", ["local"])[0] == "gemini")
@@ -960,6 +1007,7 @@ class Handler(server.BaseHTTPRequestHandler):
                 "sensor_delta_mm": sensor_delta_mm,
                 "sensor_delta_pct": sensor_delta_pct,
                 "auto_armed": auto_armed,
+                "auto_enabled": auto_enabled,
                 "present_streak": present_streak,
                 "absent_streak": absent_streak,
                 "engine": "gemini" if use_gemini else "local",

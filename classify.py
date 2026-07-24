@@ -395,6 +395,16 @@ pizza boxes, paper towel/toilet rolls, cardboard egg cartons, dry food boxes.
 baking trays, jar lids and bottle caps on empty containers.
 - Plastics #1, #2, and #5 ONLY: bottles, jugs, cups, tubs, food/beverage and takeout \
 containers, detergent/shampoo bottles, pump/spray bottles (lids/caps on).
+- Loose plastic caps/lids from bottles and jugs (they are #2 or #5): RECYCLE them.
+
+READING THE PLASTIC TYPE FROM A PHOTO:
+- You usually CANNOT see the #1/#2/#5 resin code in the photo. Do NOT trash a plastic \
+item just because the number isn't visible. Infer the type from what the object is:
+  - Clear beverage/water/soda bottles and clear food jars = #1 (PET) -> RECYCLE.
+  - Milk/water jugs, detergent/shampoo/juice bottles, opaque jugs = #2 (HDPE) -> RECYCLE.
+  - Yogurt/margarine/deli tubs, medicine bottles, most caps/lids = #5 (PP) -> RECYCLE.
+- Only treat a bottle/jug/tub/cup as non-recyclable plastic when it CLEARLY looks like \
+foam/Styrofoam (#6), a plastic bag, or plastic film/wrap.
 
 PHILADELPHIA DOES NOT ACCEPT (TRASH):
 - Plastic bags and any plastic film or wrap.
@@ -420,9 +430,10 @@ DECISION RULES:
 - Call it RECYCLE only if it clearly matches an accepted Philadelphia category AND \
 looks empty/clean enough not to contaminate the batch.
 - Contaminated recyclables (food residue, liquid still inside, grease) are TRASH.
-- When genuinely unsure, choose TRASH -- one dirty item can spoil a whole batch \
-("when in doubt, throw it out").
-- If you cannot identify the object, choose TRASH with low confidence.
+- "When in doubt, throw it out" applies to CONTAMINATION (food/liquid/grease) and to \
+objects you genuinely cannot identify -- NOT to a clean plastic bottle/jug/tub whose \
+resin number simply isn't readable in the photo. Those you should recycle (see above).
+- Only if you truly cannot tell what the object even is, choose TRASH with low confidence.
 
 Keep the reason short (max ~15 words), plain enough to read off a screen, and cite \
 the Philly rule (e.g. "Empty #1 plastic bottle -- Philly takes #1/#2/#5")."""
@@ -454,10 +465,15 @@ DECISION RULES:
 - Call it RECYCLE only if it clearly matches a locally accepted category AND looks empty/clean \
 enough not to contaminate the batch.
 - Contaminated recyclables (food residue, liquid still inside, grease) are TRASH.
+- You usually CANNOT see the #1/#2/#5 resin code in the photo. Do NOT trash a plastic item just \
+because the number isn't visible -- infer it from the object: clear drink bottles/jars = #1, \
+milk/detergent/shampoo jugs and bottles = #2, yogurt/deli tubs and most caps/lids = #5. These are \
+recyclable in almost every program. Loose bottle/jug caps and lids: RECYCLE.
 - Plastic bags, plastic film/wrap, and foam/polystyrene are TRASH in almost every curbside \
 program unless {location} explicitly accepts them.
-- When genuinely unsure, choose TRASH -- one dirty item can spoil a whole batch ("when in \
-doubt, throw it out"). If you cannot identify the object, choose TRASH with low confidence.
+- "When in doubt, throw it out" applies to contamination and to objects you genuinely cannot \
+identify -- NOT to a clean bottle/jug/tub whose resin number just isn't readable. Only if you \
+truly cannot tell what the object even is, choose TRASH with low confidence.
 
 E-WASTE -- SPECIAL HANDLING (set is_ewaste=true):
 - Batteries of ANY kind (AA/AAA/9V, button/coin cells, lithium, car, power banks), phones, \
